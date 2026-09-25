@@ -119,7 +119,7 @@ cargo tauri build --bundles nsis   # 产出 CSSwitch_0.8.4_x64-setup.exe
 cargo tauri build --bundles msi    # 产出 CSSwitch_0.8.4_x64_en-US.msi
 ```
 
-或直接取 `target/release/desktop.exe` 作为免安装便携版。
+构建产物位于 `target/release/bundle/` 下（`target/` 已被 .gitignore 排除，不入库，需本地自行构建）。
 
 ### 移植内容概览
 
