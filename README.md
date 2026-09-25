@@ -136,6 +136,7 @@ cargo tauri build --bundles msi    # 产出 CSSwitch_0.8.4_x64_en-US.msi
 - **权威快照 / 事务中途自动回滚**：基于 fd/dev/ino 的身份模型在 Windows 上不可用，已降级为跳过；一键启动中途失败时请用界面「停止全部」手动重置后重试。
 - **外部 Skill 安装桥**：Windows 上禁用（界面相关入口会报平台不支持）；本地 Skill 包导入不受影响。
 - **跨进程文件锁**：无 POSIX flock，依赖单实例运行；POSIX 文件权限由 NTACL 接管。
+- **Codex 实验功能**：代码已随移植编译通过，但未在 Windows 上实测过浏览器登录与动态模型目录，可用性未知。
 - **Claude Science `--detached` 守护进程化在 Windows 上游存在故障**，移植版改用等价的前台 + 后台挂起方式，功能一致。
 - 首次冷启动较慢（Claude Science 需恢复 conda 环境与 MCP 预热，约 1-2 分钟），健康检查预算已相应放宽。
 

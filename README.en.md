@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="./LICENSE">MIT License</a> · <strong>CSSwitch v0.8.4</strong> · macOS Apple Silicon · Tauri 2
+  <a href="./LICENSE">MIT License</a> · <strong>CSSwitch v0.8.4</strong> · macOS Apple Silicon · Windows 11 x64 (community port) · Tauri 2
 </p>
 
 <p align="center">
@@ -12,6 +12,8 @@
 </p>
 
 > Linux x64 users can use the [CSSwitch v0.8.1 Linux x64 prerelease](https://github.com/SuperJJ007/CSSwitch/releases/tag/v0.8.1-linux-x64), provided as an amd64 `.deb` package.
+
+> Windows x64 is supported by a community port in this repository (based on upstream v0.8.4). Requirements, build steps, and known limitations are documented in the [Windows support section](./README.md#windows-支持levin000-移植) of the Chinese README.
 
 <p align="center">
   <img src="docs/assets/csswitch-v0.8-ui-demo.gif" alt="CSSwitch v0.8 series UI demo" width="942">
@@ -30,6 +32,8 @@
 ## Install and start
 
 You need an Apple Silicon Mac, [Claude Science](https://claude.com/download), and either a third-party model API key or a Codex account.
+
+> **Windows x64:** install Claude Science for Windows and [Git for Windows](https://git-scm.com/download/win), then build locally (`cargo tauri build --bundles nsis`). See the [Windows support section](./README.md#windows-支持levin000-移植) for details and known limitations.
 
 1. Download [`CSSwitch_0.8.4_aarch64.dmg`](https://github.com/SuperJJ007/CSSwitch/releases/download/v0.8.4/CSSwitch_0.8.4_aarch64.dmg) and drag CSSwitch into Applications. Optionally verify the public attachment SHA-256 against the [v0.8.4 release evidence](./docs/evidence/releases/v0.8.4.md).
 2. Create a profile and enter the API key, model names, and `base_url` when required.
@@ -62,7 +66,8 @@ CSSwitch only manages content it imported. Name conflicts never overwrite existi
 
 ## Current boundaries
 
-- The current macOS Apple Silicon release is **v0.8.4**; layered evidence is in the [v0.8.4 release evidence](./docs/evidence/releases/v0.8.4.md). Public desktop builds currently target macOS Apple Silicon only.
+- The current macOS Apple Silicon release is **v0.8.4**; layered evidence is in the [v0.8.4 release evidence](./docs/evidence/releases/v0.8.4.md).
+- **Windows x64 is supported by a community port** in this repository (upstream macOS logic preserved unchanged behind `#[cfg]` branches). Some safety mechanisms are degraded on Windows; see the [Windows known boundaries](./README.md#已知边界与降级项) for details.
 - Third-party mode does not grant Anthropic account privileges; hosted MCP services, directory connectors, and some cloud features may be unavailable.
 - Codex remains an off-by-default experiment with one browser-authenticated account.
 - The Rust Gateway is bundled; no separate Python runtime is required.
@@ -77,6 +82,16 @@ cd desktop
 npm install
 npm run tauri dev
 ```
+
+Windows (Rust MSVC toolchain + VS Build Tools):
+
+```bash
+cd desktop/src-tauri
+cargo build          # debug
+cargo tauri build    # release + installers
+```
+
+> The Windows port has not yet ported the `#[cfg(test)]` suites; `cargo test` is unavailable on Windows for now.
 
 Run the complete local gate with:
 
