@@ -13,6 +13,7 @@
   <a href="./LICENSE"><img src="https://img.shields.io/github/license/SuperJJ007/CSSwitch?style=flat-square&amp;logo=opensourceinitiative" alt="MIT License"></a>
   <a href="https://github.com/SuperJJ007/CSSwitch/releases/latest"><img src="https://img.shields.io/github/v/release/SuperJJ007/CSSwitch?display_name=tag&amp;style=flat-square" alt="Latest Release"></a>
   <img src="https://img.shields.io/badge/macOS-Apple%20Silicon-000000?style=flat-square&amp;logo=apple&amp;logoColor=white" alt="macOS Apple Silicon">
+  <img src="https://img.shields.io/badge/Windows-11%20x64-0078D4?style=flat-square&amp;logo=windows11" alt="Windows 11 x64">
   <img src="https://img.shields.io/badge/Tauri-2-24C8DB?style=flat-square&amp;logo=tauri&amp;logoColor=white" alt="Tauri 2">
 </p>
 
@@ -27,6 +28,8 @@
 
 > Linux x64 用户可以使用 [CSSwitch v0.8.1 Linux x64 预发布版](https://github.com/SuperJJ007/CSSwitch/releases/tag/v0.8.1-linux-x64)，提供 amd64 `.deb` 安装包。
 
+> Windows x64 用户请参见本仓库的 [Windows 支持](#windows-支持levin000-移植) 章节（基于上游 v0.8.4 的社区移植版）。
+
 <p align="center">
   <img src="docs/assets/csswitch-v0.8-ui-demo.gif" alt="CSSwitch v0.8 系列界面演示" width="942">
 </p>
@@ -34,9 +37,10 @@
 ---
 
 <p align="center">
-  <a href="https://github.com/SuperJJ007/CSSwitch/releases/download/v0.8.4/CSSwitch_0.8.4_aarch64.dmg">下载 v0.8.4</a> ·
+  <a href="https://github.com/SuperJJ007/CSSwitch/releases/download/v0.8.4/CSSwitch_0.8.4_aarch64.dmg">下载 macOS v0.8.4</a> ·
   <a href="#功能介绍">功能介绍</a> ·
   <a href="#安装与启动">安装与启动</a> ·
+  <a href="#windows-支持levin000-移植">Windows 支持</a> ·
   <a href="#provider-与模型">Provider 与模型</a> ·
   <a href="#使用-codex">Codex</a> ·
   <a href="#skill">Skill</a> ·
@@ -52,21 +56,19 @@
 | Skill | 已支持 | 查看当前 Science 组织中的 Skill，从本地包导入，或让 Agent 从准确的公开 GitHub URL 安装。 |
 | MCP | 即将支持 | v0.8.4 尚未提供面向用户的通用 MCP 添加、配置和运行管理；后续版本会继续完善。 |
 
-## 社区
-
-<p align="center">
-  <img src="docs/assets/wechat-group.jpg" alt="CSSwitch 社区微信群二维码" width="420">
-</p>
-
 ## 安装与启动
 
-需要一台 Apple Silicon Mac、已安装的 [Claude Science](https://claude.com/download)，以及可用的第三方模型 API Key 或 Codex 账号。
+### macOS（Apple Silicon）
 
-### 第一次安装
+需要一台 Apple Silicon Mac、已安装的 [Claude Science](https://claude.com/download)，以及可用的第三方模型 API Key 或 Codex 账号。
 
 1. 下载 [`CSSwitch_0.8.4_aarch64.dmg`](https://github.com/SuperJJ007/CSSwitch/releases/download/v0.8.4/CSSwitch_0.8.4_aarch64.dmg)，打开后将 CSSwitch 拖入「应用程序」。可按 [v0.8.4 发布证据](./docs/evidence/releases/v0.8.4.md) 核对公开附件 SHA-256。
 2. 确认电脑上已经安装 [Claude Science](https://claude.com/download)，然后打开 CSSwitch。
 3. 首次打开如被 macOS 阻止，请在 Finder 中右键 CSSwitch，选择「打开」。当前公开包为 ad-hoc 签名，不是 Developer ID / 公证 / Gatekeeper 结论。
+
+### Windows（x64）
+
+需要 Windows 11 x64、已安装的 [Claude Science](https://claude.com/download)（Windows 版）、[Git for Windows](https://git-scm.com/download/win)（沙箱脚本依赖其自带 bash），以及可用的第三方模型 API Key。安装与构建方式见 [Windows 支持](#windows-支持levin000-移植) 章节。
 
 ### 连接第三方模型
 
@@ -93,6 +95,49 @@
 2. 打开「Skill & MCP」，点击「刷新」查看当前 Science 组织中发现的 Skill、来源和绑定状态。
 3. 本地包可以点击「导入本地 Skill 包」，选择 `.zip` 或 `.skill`；公开 GitHub Skill 则在 Science 中把准确 URL 交给 Agent，由 CSSwitch connector 完成安装。
 4. 页面显示“已绑定”后，仍建议在当前 Agent 会话调用对应的 `skill()`，确认它已经实际加载。
+
+> Windows 移植版的 Skill 安装桥当前为禁用状态，详见[ Windows 支持边界](#已知边界与降级项)。
+
+## Windows 支持（Levin000 移植）
+
+本仓库在上游 [SuperJJ007/CSSwitch](https://github.com/SuperJJ007/CSSwitch) v0.8.4 基础上增加了完整的 Windows x64 支持（Windows 移植版 fork：[Levin000/CSSwitch-Windows](https://github.com/Levin000/CSSwitch-Windows)）。macOS 的全部原始逻辑以 `#[cfg]` 成对分支方式逐字保留，未做删改。
+
+### 前置条件
+
+- Windows 11 x64
+- [Claude Science](https://claude.com/download) Windows 版（默认探测 `%LOCALAPPDATA%\Programs\ClaudeScience`，非默认路径可用 `CSSWITCH_SCIENCE_APP_BIN` 环境变量指定）
+- [Git for Windows](https://git-scm.com/download/win)（默认探测 `C:\Program Files\Git\`，可用 `CSSWITCH_GIT_BASH` 指定 bash.exe 完整路径）
+- 第三方模型 API Key（中转站需提供 OpenAI Chat Completions 或 Anthropic Messages 兼容端点）
+
+### 构建安装包
+
+```bash
+# 工具链：Rust (MSVC) + VS Build Tools (C++ 工作负载) + tauri-cli
+cargo install tauri-cli --locked
+
+cargo tauri build --bundles nsis   # 产出 CSSwitch_0.8.4_x64-setup.exe
+cargo tauri build --bundles msi    # 产出 CSSwitch_0.8.4_x64_en-US.msi
+```
+
+或直接取 `target/release/desktop.exe` 作为免安装便携版。
+
+### 移植内容概览
+
+| 层 | 改动 |
+| --- | --- |
+| 平台兼容层（`platform.rs`） | POSIX 权限语义映射（只读属性 ↔ 0o500/0o600）、`\\?\` verbatim 路径剥离、bash 路径转换、Win32 进程探测（退出码 / 映像路径 / 启动时间）、BCrypt 加密随机数、目录/文件同步、taskkill 组终止 |
+| 沙箱脚本 | zsh → bash（Git Bash）移植：GNU 工具适配、盘符路径处理、Windows 已知目录环境注入、`--detached` 不可用的前台 + 后台等价启动、UTF-8 控制台 |
+| 事务与恢复 | 权威快照引擎（fd/dev/ino 身份锚定）降级跳过；中断事务自动清账 + 网关重启 |
+| 子进程环境 | `env_clear` 白名单补充 `SystemRoot`/`USERPROFILE`/`ProgramData` 等 OS 必需变量 |
+| 其他 | 进程身份用 `netstat` + `QueryFullProcessImageName` 等价实现；浏览器/官方模式打开适配；遥测退避开关 |
+
+### 已知边界与降级项
+
+- **权威快照 / 事务中途自动回滚**：基于 fd/dev/ino 的身份模型在 Windows 上不可用，已降级为跳过；一键启动中途失败时请用界面「停止全部」手动重置后重试。
+- **外部 Skill 安装桥**：Windows 上禁用（界面相关入口会报平台不支持）；本地 Skill 包导入不受影响。
+- **跨进程文件锁**：无 POSIX flock，依赖单实例运行；POSIX 文件权限由 NTACL 接管。
+- **Claude Science `--detached` 守护进程化在 Windows 上游存在故障**，移植版改用等价的前台 + 后台挂起方式，功能一致。
+- 首次冷启动较慢（Claude Science 需恢复 conda 环境与 MCP 预热，约 1-2 分钟），健康检查预算已相应放宽。
 
 ## Provider 与模型
 
@@ -123,21 +168,24 @@ CSSwitch 当前聚焦于安全地把外部 Skill 接入隔离 Science，而不�
 ## 安全与隔离
 
 - 第三方模式使用独立 HOME、data-dir 和本地回环 Gateway，不读取或修改真实 Claude 登录与 Science 数据。
-- API Key 保存在本机 `~/.csswitch/config.json`，文件权限为 `0600`；凭据不会写入日志。
+- API Key 保存在本机 `~/.csswitch/config.json`；macOS 下文件权限为 `0600`，Windows 下由 NTACL 管理访问控制；凭据不会写入日志。
 - 官方 Claude 模式会停止第三方代理链路，再打开真实 Science。
 - CSSwitch 不下载或自动升级 Claude Science；新启动会优先采用本机官方 updater 已下载并通过本地身份校验的 runtime snapshot，否则使用当前安装的官方 App。
 
 ## 当前边界
 
-- 当前 macOS Apple Silicon 正式版本为 **v0.8.4**；分层发布证据见 [v0.8.4 发布证据](./docs/evidence/releases/v0.8.4.md)。公开桌面包目前只支持 macOS Apple Silicon。
+- 当前 macOS Apple Silicon 正式版本为 **v0.8.4**；分层发布证据见 [v0.8.4 发布证据](./docs/evidence/releases/v0.8.4.md)。
+- **Windows x64 由社区移植支持**（本仓库），基于上游 v0.8.4；边界与降级项见 [Windows 已知边界](#已知边界与降级项)。
 - 第三方模式不提供 Anthropic 账号权限，托管 MCP、目录连接器和部分云端能力可能不可用。
 - Codex 仍是默认关闭的实验能力，当前只支持单账号浏览器登录。
 - Rust Gateway 已随应用打包，不需要单独安装 Python runtime。
 - source/unit、最终附件、安装身份、签名与 live provider/账号是不同证据层；下载页或 source gate 通过不能外推为全部真实 provider、SSH 或 Science 领域能力已验证。
 
-升级、回滚和已知限制见[项目文档](./docs/README.md)。问题反馈请使用 [GitHub Issues](https://github.com/SuperJJ007/CSSwitch/issues)。
+升级、回滚和已知限制见[项目文档](./docs/README.md)。问题反馈：macOS 请使用 [上游 GitHub Issues](https://github.com/SuperJJ007/CSSwitch/issues)；Windows 移植请使用 [Levin000/CSSwitch-Windows Issues](https://github.com/Levin000/CSSwitch-Windows/issues)。
 
 ## 开发
+
+macOS：
 
 ```bash
 cd desktop
@@ -145,7 +193,15 @@ npm install
 npm run tauri dev
 ```
 
-完整检查：
+Windows（Rust MSVC 工具链 + VS Build Tools）：
+
+```bash
+cd desktop/src-tauri
+cargo build          # 调试版
+cargo tauri build    # release + 安装包
+```
+
+完整检查（macOS）：
 
 ```bash
 GATE_ROOT="$(mktemp -d /private/tmp/csg.XXXXXX)"
@@ -153,4 +209,13 @@ chmod 700 "$GATE_ROOT"
 bash test/run_all.sh --output-root "$GATE_ROOT"
 ```
 
+> Windows 移植版的测试套件（`#[cfg(test)]` 模块）尚未移植，`cargo test` 暂不可用。
+
 [更新日志](./CHANGELOG.md) · [开发与测试](./docs/operations/development.md) · [发布证据](./docs/evidence/releases/README.md)
+
+---
+
+## 致谢
+
+- 上游项目：[SuperJJ007/CSSwitch](https://github.com/SuperJJ007/CSSwitch)（macOS Apple Silicon 原版）
+- Windows 移植：[Levin000](https://github.com/Levin000)（基于 v0.8.4，MIT License）
