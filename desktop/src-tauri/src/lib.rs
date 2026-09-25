@@ -487,6 +487,15 @@ fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
 }
 
 fn install_menu(app: &tauri::App) -> tauri::Result<()> {
+    // Windows 移植：菜单栏是 macOS 平台惯例（系统菜单 + Cmd+, 偏好设置）；
+    // Windows 上显示为窗口顶部菜单条，非本平台习惯，直接不安装。
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
     use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
 
     let preferences = MenuItemBuilder::with_id("preferences", "偏好设置...")
@@ -521,6 +530,7 @@ fn install_menu(app: &tauri::App) -> tauri::Result<()> {
         }
     });
     Ok(())
+    }
 }
 
 #[allow(

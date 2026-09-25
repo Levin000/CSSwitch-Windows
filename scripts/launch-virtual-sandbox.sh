@@ -37,6 +37,15 @@ abspath() {
   fi
 }
 
+# Windows 移植：把承载本脚本的控制台切到 UTF-8（65001）。守护进程与脚本
+# 自身都输出 UTF-8，中文 Windows 控制台默认 GBK(936) 会把标点误解码成
+# 鈥?/路 之类的乱码。无控制台（隐藏窗口）时静默失败，不影响流程。
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    cmd //c "chcp 65001" >/dev/null 2>&1 || true
+    ;;
+esac
+
 PROJ="$(cd -- "$(dirname -- "$(dirname -- "$0")")" && pwd -P)"
 SANDBOX_HOME="${SANDBOX_HOME:-$PROJ/.sandbox/home}"
 DATA_DIR="$SANDBOX_HOME/.claude-science"   # = auth_dir（Science 按 HOME 推导）
@@ -458,6 +467,11 @@ _SCIENCE_ENV=(
   "HTTPS_PROXY=$_FASTFAIL_PROXY"
   "no_proxy=$_NO_PROXY"
   "NO_PROXY=$_NO_PROXY"
+  # Anthropic CLI 官方退避开关：虚拟登录不上官方云，关掉守护进程的
+  # 遥测/非必要流量轮询，消除周期性 401 重试噪音。
+  "DO_NOT_TRACK=1"
+  "OPERON_DISABLE_TELEMETRY=1"
+  "OPERON_DISABLE_NONESSENTIAL_TRAFFIC=1"
 )
 # Windows 移植：已知目录解析（SHGetKnownFolderPath 回退链）与 CRT 初始化
 # 需要这些系统变量，env -i 后必须补回；USERPROFILE/APPDATA 指向隔离 HOME
