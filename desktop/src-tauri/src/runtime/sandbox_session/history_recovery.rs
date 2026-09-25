@@ -1,5 +1,10 @@
+#[cfg(not(unix))]
+use crate::platform::UnixCompatExt;
+
 use std::io::Read;
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 use serde::{Deserialize, Serialize};
@@ -299,10 +304,10 @@ fn captured_history_authority_entry(
     let (_, _, backup) = history_authority_paths(kind, snapshot_root, sandbox_root, auth_dir)?;
     match std::fs::symlink_metadata(&backup) {
         Ok(metadata) => {
-            let file_type = metadata.mode() & u32::from(libc::S_IFMT);
+            let file_type = metadata.mode() & u32::from(crate::platform::S_IFMT);
             if metadata.file_type().is_symlink()
-                || (file_type != u32::from(libc::S_IFREG) && file_type != u32::from(libc::S_IFDIR))
-                || metadata.uid() != unsafe { libc::geteuid() }
+                || (file_type != u32::from(crate::platform::S_IFREG) && file_type != u32::from(crate::platform::S_IFDIR))
+                || metadata.uid() != unsafe { crate::platform::geteuid() }
             {
                 return Err("history recovery backup entry identity is unsafe".into());
             }
@@ -370,13 +375,13 @@ fn read_history_authority_manifest(
 ) -> Result<HistoryRecoveryAuthorityManifest, String> {
     let name = std::ffi::CString::new(HISTORY_RECOVERY_MANIFEST_FILE).unwrap();
     let file =
-        AuthorityTreeSnapshot::open_destination_at(root.as_raw_fd(), &name, libc::O_RDONLY, 0)
+        AuthorityTreeSnapshot::open_destination_at(root.as_raw_fd(), &name, crate::platform::O_RDONLY, 0)
             .map_err(|error| format!("history recovery manifest open failed: {error}"))?;
     let metadata = file
         .metadata()
         .map_err(|error| format!("history recovery manifest metadata failed: {error}"))?;
     if !metadata.is_file()
-        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.uid() != unsafe { crate::platform::geteuid() }
         || metadata.permissions().mode() & 0o777 != 0o600
         || metadata.nlink() != 1
         || metadata.len() == 0
@@ -468,7 +473,7 @@ fn reopen_history_authority_entry(
     };
     let backup_name = AuthorityTreeSnapshot::destination_name(&backup)?;
     let expected_identity = match (entry.backup_device, entry.backup_inode, entry.backup_kind) {
-        (Some(device), Some(inode), Some(kind)) => Some((device, inode, kind as libc::mode_t)),
+        (Some(device), Some(inode), Some(kind)) => Some((device, inode, kind as crate::platform::ModeT)),
         (None, None, None) => None,
         _ => return Err("history recovery manifest entry identity is incomplete".into()),
     };
@@ -479,7 +484,7 @@ fn reopen_history_authority_entry(
             let actual_identity = (
                 u64::try_from(actual.st_dev).ok(),
                 super::authority_snapshot::inode_u64(actual.st_ino),
-                actual.st_mode & libc::S_IFMT,
+                actual.st_mode & crate::platform::S_IFMT,
             );
             if actual_identity != (Some(expected.0), Some(expected.1), expected.2) {
                 return Err("history recovery backup identity changed".into());

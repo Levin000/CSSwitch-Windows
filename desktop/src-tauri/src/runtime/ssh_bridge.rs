@@ -1,6 +1,17 @@
+#[cfg(not(unix))]
+use std::os::windows::fs::OpenOptionsExt as _;
+
+#[cfg(not(unix))]
+use crate::platform::UnixCompatExt;
+#[cfg(not(unix))]
+use crate::platform::OpenOptionsModeExt;
+#[cfg(not(unix))]
+use std::os::windows::fs::OpenOptionsExt as _;
+
 use std::collections::{BTreeSet, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -243,7 +254,7 @@ fn checked_file_bytes(path: &Path, limit: u64, label: &str) -> Result<Option<Vec
     let mut options = OpenOptions::new();
     options
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+        .custom_flags(crate::platform::O_NOFOLLOW | crate::platform::O_NONBLOCK | crate::platform::O_CLOEXEC);
     let file = match options.open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -251,7 +262,7 @@ fn checked_file_bytes(path: &Path, limit: u64, label: &str) -> Result<Option<Vec
     };
     let metadata = file.metadata().map_err(|_| format!("无法检查{label}"))?;
     // SAFETY: geteuid has no preconditions and does not dereference pointers.
-    let uid = unsafe { libc::geteuid() };
+    let uid = unsafe { crate::platform::geteuid() };
     if metadata.file_type().is_symlink()
         || !metadata.file_type().is_file()
         || metadata.len() > limit
@@ -340,7 +351,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     fs::create_dir_all(parent).map_err(|_| "无法创建隔离 Science 状态目录".to_string())?;
     let parent_meta = fs::symlink_metadata(parent).map_err(|_| "无法检查隔离 Science 状态目录")?;
     // SAFETY: geteuid has no preconditions and does not dereference pointers.
-    let uid = unsafe { libc::geteuid() };
+    let uid = unsafe { crate::platform::geteuid() };
     if parent_meta.file_type().is_symlink()
         || !parent_meta.is_dir()
         || parent_meta.uid() != uid
@@ -363,14 +374,14 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        .custom_flags(crate::platform::O_NOFOLLOW | crate::platform::O_CLOEXEC);
     let mut file = options.open(&tmp).map_err(|_| "无法创建隔离状态临时文件")?;
     let result = (|| -> Result<(), String> {
         file.write_all(bytes)
             .map_err(|_| "无法写入隔离状态临时文件")?;
         file.sync_all().map_err(|_| "无法同步隔离状态临时文件")?;
         fs::rename(&tmp, path).map_err(|_| "无法原子提交隔离状态文件")?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        fs::set_permissions(path, crate::platform::permissions_from_mode(0o600))
             .map_err(|_| "无法收紧隔离状态文件权限")?;
         file.sync_all().map_err(|_| "无法同步隔离状态文件元数据")?;
         sync_directory(parent)?;
@@ -389,14 +400,14 @@ fn sync_directory(path: &Path) -> Result<(), String> {
     }
     let directory = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(crate::platform::O_DIRECTORY | crate::platform::O_NOFOLLOW | crate::platform::O_CLOEXEC)
         .open(path)
         .map_err(|error| format!("无法打开隔离状态父目录进行同步：{error}"))?;
     let metadata = directory
         .metadata()
         .map_err(|error| format!("无法检查隔离状态父目录：{error}"))?;
     // SAFETY: geteuid has no preconditions and does not dereference pointers.
-    let uid = unsafe { libc::geteuid() };
+    let uid = unsafe { crate::platform::geteuid() };
     if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o022 != 0 {
         return Err("隔离状态父目录不安全，拒绝同步".into());
     }
@@ -547,7 +558,7 @@ pub(crate) fn prevalidate_science_ssh_bridge(
         // This is deliberately a metadata-only check. The one-click transaction
         // must reject an authority that is statically non-writable before OAuth
         // or journal mutation without leaving a write-probe artifact behind.
-        let uid = unsafe { libc::geteuid() };
+        let uid = unsafe { crate::platform::geteuid() };
         if let Ok(metadata) = fs::symlink_metadata(&data_dir) {
             if !metadata.file_type().is_dir()
                 || metadata.uid() != uid
@@ -739,7 +750,7 @@ mod tests {
 
     fn write_private(path: &Path, value: impl AsRef<[u8]>) {
         fs::write(path, value).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(path, crate::platform::permissions_from_mode(0o600)).unwrap();
     }
 
     #[test]
@@ -898,7 +909,7 @@ mod tests {
         );
         fs::set_permissions(
             foreign.join("config.toml"),
-            fs::Permissions::from_mode(0o000),
+            crate::platform::permissions_from_mode(0o000),
         )
         .unwrap();
         std::os::unix::fs::symlink(&foreign, sandbox.join(".claude-science")).unwrap();
@@ -911,7 +922,7 @@ mod tests {
             .contains("包含符号链接"));
         fs::set_permissions(
             foreign.join("config.toml"),
-            fs::Permissions::from_mode(0o600),
+            crate::platform::permissions_from_mode(0o600),
         )
         .unwrap();
         assert_eq!(

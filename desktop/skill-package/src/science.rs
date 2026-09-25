@@ -414,13 +414,17 @@ fn validate_context(context: &ScienceHostContext) -> Result<(), AttachError> {
             AttachError::new("SCIENCE_NOT_READY", "Science host context 不完整").retryable(true),
         );
     }
-    let canonical = context.binary.canonicalize().map_err(|_| {
+    let canonical = canonicalize_plain(&context.binary).map_err(|_| {
         AttachError::new("SCIENCE_RUNTIME_CHANGED", "Science binary 不可用").retryable(true)
     })?;
     if canonical != context.binary {
+        // Windows 移植诊断：输出两侧路径的精确表示，定位剩余差异来源。
         return Err(AttachError::new(
             "SCIENCE_RUNTIME_CHANGED",
-            "Science binary canonical path 已变化",
+            format!(
+                "Science binary canonical path 已变化: canonical={:?} binary={:?}",
+                canonical, context.binary
+            ),
         )
         .retryable(true));
     }
@@ -489,10 +493,78 @@ fn executable_fingerprint(path: &Path) -> Option<ScienceExecutableFingerprint> {
     }
     #[cfg(not(unix))]
     {
-        let _ = path;
-        None
+        // Windows 移植：与 src-tauri 平台兼容层同语义——dev/ino 恒 0、
+        // mode 按只读属性映射（0o500/0o600）、size/mtime/sha256 取真实值。
+        use std::io::Read;
+        let mut file = OpenOptions::new().read(true).open(path).ok()?;
+        let before = file.metadata().ok()?;
+        if !before.is_file() {
+            return None;
+        }
+        let mut digest = Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer).ok()?;
+            if count == 0 {
+                break;
+            }
+            digest.update(&buffer[..count]);
+        }
+        let after = file.metadata().ok()?;
+        if after.len() != before.len() {
+            return None;
+        }
+        let stamp = |metadata: &std::fs::Metadata| {
+            metadata.modified().ok().and_then(|value| {
+                value
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|duration| (duration.as_secs() as i64, duration.subsec_nanos() as i64))
+            })
+        };
+        let (before_secs, before_nanos) = stamp(&before)?;
+        let (after_secs, after_nanos) = stamp(&after)?;
+        if (before_secs, before_nanos) != (after_secs, after_nanos) {
+            return None;
+        }
+        let mode = if after.permissions().readonly() {
+            0o500
+        } else {
+            0o600
+        };
+        Some(ScienceExecutableFingerprint {
+            device: 0,
+            inode: 0,
+            size: after.len(),
+            modified_seconds: after_secs,
+            modified_nanoseconds: after_nanos,
+            mode,
+            sha256: digest
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        })
     }
 }
+
+/// Windows 的 canonicalize 返回 `\?\` verbatim 前缀路径，与普通路径
+/// 比较永不相等；剥掉前缀保持可比较（Unix 直通 std）。
+fn canonicalize_plain(path: &Path) -> std::io::Result<std::path::PathBuf> {
+    let canonical = path.canonicalize()?;
+    #[cfg(windows)]
+    {
+        let text = canonical.as_os_str().to_string_lossy();
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return Ok(std::path::PathBuf::from(format!(r"\\{rest}")));
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            return Ok(std::path::PathBuf::from(rest.to_string()));
+        }
+    }
+    Ok(canonical)
+}
+
 
 fn require_active_org(
     context: &ScienceHostContext,
@@ -520,6 +592,36 @@ fn require_active_org(
     }
     Ok(())
 }
+
+#[cfg(windows)]
+/// Windows 移植：受控子进程（claude-science url 等）的守护进程探测依赖
+/// netstat/进程查询等系统命令，env_clear 后必须补回 OS 必需变量；
+/// USERPROFILE 指向隔离 HOME 保持隔离语义。
+fn augment_windows_env(command: &mut Command, home: &Path) {
+    command.env("USERPROFILE", home);
+    if let Some(value) = std::env::var_os("SystemRoot") {
+        command.env("SystemRoot", value);
+    }
+    if let Some(value) = std::env::var_os("SystemDrive") {
+        command.env("SystemDrive", value);
+    }
+    if let Some(value) = std::env::var_os("ProgramData") {
+        command.env("ProgramData", value);
+    }
+    if let Some(value) = std::env::var_os("TEMP") {
+        command.env("TEMP", value);
+    }
+    if let Some(value) = std::env::var_os("TMP") {
+        command.env("TMP", value);
+    }
+    command.env(
+        "PATH",
+        r"C:\Windows\System32;C:\Windows;C:\Windows\System32\WindowsPowerShell\v1.0\",
+    );
+}
+
+#[cfg(unix)]
+fn augment_windows_env(_command: &mut Command, _home: &Path) {}
 
 fn fresh_control_url(context: &ScienceHostContext) -> Result<String, AttachError> {
     fresh_control_url_before(context, Instant::now() + PROCESS_TIMEOUT)
@@ -578,6 +680,7 @@ fn fresh_control_url_before(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    augment_windows_env(&mut command, &context.home);
     #[cfg(unix)]
     unsafe {
         use std::os::unix::process::CommandExt;
@@ -780,11 +883,10 @@ fn validate_control_url(raw: &str, expected_port: u16) -> Result<(String, String
         ));
     }
     Ok((
-        format!(
-            "http://{}:{}",
-            url.host_str().expect("validated host"),
-            expected_port
-        ),
+        // Windows 移植：守护进程只绑 IPv4 127.0.0.1；localhost 可能先解析到
+        // ::1（IPv6）导致连接层失败，统一归一为 127.0.0.1（macOS 同样只绑
+        // 127.0.0.1，归一无副作用）。
+        format!("http://127.0.0.1:{expected_port}"),
         nonces[0].clone(),
     ))
 }

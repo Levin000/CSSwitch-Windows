@@ -1026,7 +1026,11 @@ pub(crate) fn scan_installed_payload_with_limits(
                     "recovery",
                 ));
             }
-            if relative.as_os_str().as_bytes().len() > MAX_PATH_BYTES
+            #[cfg(unix)]
+            let path_len = relative.as_os_str().as_bytes().len();
+            #[cfg(not(unix))]
+            let path_len = relative.as_os_str().len();
+            if path_len > MAX_PATH_BYTES
                 || relative.components().count() > MAX_PATH_DEPTH
             {
                 return Err(error(

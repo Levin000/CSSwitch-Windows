@@ -1,3 +1,8 @@
+#[cfg(not(unix))]
+use crate::platform::UnixCompatExt;
+#[cfg(not(unix))]
+use crate::platform::OpenOptionsModeExt;
+
 #[cfg(any(test, feature = "acceptance-build"))]
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
@@ -268,8 +273,7 @@ fn invalidate_route_configuration_unfenced(data_dir: &Path) -> Result<(), String
     reject_symlink_path(&path)?;
     match fs::remove_file(&path) {
         Ok(()) => {
-            File::open(data_dir)
-                .and_then(|directory| directory.sync_all())
+            crate::platform::sync_directory(data_dir)
                 .map_err(|error| format!("同步 Skill 路由状态目录失败：{error}"))?;
             Ok(())
         }
@@ -530,6 +534,7 @@ fn write_config_atomic(path: &Path, value: &Value) -> Result<(), String> {
         options.write(true).create_new(true);
         #[cfg(unix)]
         {
+            #[cfg(unix)]
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
@@ -543,8 +548,7 @@ fn write_config_atomic(path: &Path, value: &Value) -> Result<(), String> {
         file.sync_all()
             .map_err(|e| format!("同步 MCP 配置失败：{e}"))?;
         fs::rename(&temp, path).map_err(|e| format!("提交 MCP 配置失败：{e}"))?;
-        File::open(parent)
-            .and_then(|dir| dir.sync_all())
+        crate::platform::sync_directory(parent)
             .map_err(|e| format!("同步 MCP 目录失败：{e}"))?;
         Ok(())
     })();
@@ -569,6 +573,7 @@ fn write_route_state_atomic(path: &Path, value: &Value) -> Result<(), String> {
         options.write(true).create_new(true);
         #[cfg(unix)]
         {
+            #[cfg(unix)]
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
@@ -585,8 +590,7 @@ fn write_route_state_atomic(path: &Path, value: &Value) -> Result<(), String> {
         #[cfg(unix)]
         fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
             .map_err(|error| format!("收紧 Skill 路由状态权限失败：{error}"))?;
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
+        crate::platform::sync_directory(parent)
             .map_err(|error| format!("同步 Skill 路由状态目录失败：{error}"))?;
         Ok(())
     })();
@@ -632,11 +636,12 @@ mod tests {
     }
 
     fn control_script(root: &Path, label: &str, body: &str) -> PathBuf {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
 
         let path = root.join(label);
         fs::write(&path, format!("#!/bin/sh\nset -eu\n{body}\n")).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&path, crate::platform::permissions_from_mode(0o755)).unwrap();
         path
     }
 
@@ -857,6 +862,7 @@ mod tests {
 
     #[test]
     fn route_state_is_persistent_versioned_and_secret_free() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
 
         let root = temp_dir("route-state");
@@ -883,6 +889,7 @@ mod tests {
 
     #[test]
     fn corrupt_or_unsafe_route_state_never_counts_as_configured() {
+        #[cfg(unix)]
         use std::os::unix::fs::symlink;
 
         let root = temp_dir("route-state-invalid");
@@ -1040,7 +1047,7 @@ mod tests {
             .unwrap();
         let gone = (0..100).any(|_| {
             // SAFETY: signal 0 only probes the test-owned descendant pid.
-            if unsafe { libc::kill(descendant_pid, 0) } == -1
+            if unsafe { crate::platform::kill(descendant_pid, 0) } == -1
                 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
             {
                 return true;
@@ -1118,7 +1125,7 @@ mod tests {
         let gone = (0..100).any(|_| {
             // SAFETY: signal 0 only probes the test-owned pid recorded by the
             // private process group; it does not send a signal.
-            if unsafe { libc::kill(descendant_pid, 0) } == -1
+            if unsafe { crate::platform::kill(descendant_pid, 0) } == -1
                 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
             {
                 return true;

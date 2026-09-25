@@ -1,6 +1,18 @@
 //! Mechanical extract from `sandbox_session` (behavior-preserving).
+#[cfg(not(unix))]
+use std::os::windows::fs::OpenOptionsExt as _;
+
+#[cfg(not(unix))]
+use crate::platform::UnixCompatExt;
+#[cfg(not(unix))]
+use crate::platform::OpenOptionsModeExt;
+#[cfg(not(unix))]
+use std::os::windows::fs::OpenOptionsExt as _;
+
 use std::io::Read;
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -260,7 +272,7 @@ pub(super) fn read_marker(path: &Path) -> Result<String, AuthorityCleanupFailure
         .map_err(|_| identity_error("cleanup_identity_invalid：事务快照 marker 不可用。"))?;
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
-        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.uid() != unsafe { crate::platform::geteuid() }
         || metadata.permissions().mode() & 0o777 != 0o600
         || metadata.nlink() != 1
         || metadata.len() > 256
@@ -271,7 +283,7 @@ pub(super) fn read_marker(path: &Path) -> Result<String, AuthorityCleanupFailure
     }
     let mut file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(crate::platform::O_NOFOLLOW | crate::platform::O_CLOEXEC)
         .open(path)
         .map_err(|_| identity_error("cleanup_identity_invalid：无法安全打开事务快照 marker。"))?;
     let opened = file
@@ -320,8 +332,8 @@ pub(super) fn inspect_pending_cleanup_target(
     let marker = marker.strip_suffix('\n').unwrap_or(&marker).to_string();
     if metadata.file_type().is_symlink()
         || !metadata.is_dir()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.permissions().mode() & 0o777 != 0o700
+        || metadata.uid() != unsafe { crate::platform::geteuid() }
+        || !crate::platform::dir_mode_is_0700(&metadata)
     {
         return PendingCleanupTargetState::Unsafe;
     }
@@ -406,13 +418,13 @@ impl AuthorityCleanupContext {
 
     pub(super) fn bind_root_identity(
         &mut self,
-        entry: &libc::stat,
+        entry: &crate::platform::Stat,
     ) -> Result<(), AuthorityCleanupFailure> {
         let device = u64::try_from(entry.st_dev)
             .map_err(|_| self.register_error("事务快照 device 非法。"))?;
         let inode =
             inode_u64(entry.st_ino).ok_or_else(|| self.register_error("事务快照 inode 非法。"))?;
-        if entry.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        if entry.st_mode & crate::platform::S_IFMT != crate::platform::S_IFDIR {
             return Err(self.register_error("事务快照不是目录。"));
         }
         self.expected_root_identity = Some((device, inode));
@@ -430,9 +442,31 @@ impl AuthorityCleanupContext {
     }
 }
 
+#[allow(unreachable_code)]
 pub(super) fn register_authority_cleanup(
     context: &AuthorityCleanupContext,
 ) -> Result<RegisteredAuthorityCleanup, AuthorityCleanupFailure> {
+    // Windows 降级注册：真实注册依赖 openat 锚定的目录身份、0600/nlink marker
+    // 持久化与 pending 清单 CAS 提交；降级 capture 从未创建快照目录，因此
+    // 不写 pending 清单、不登记 state.pending_authority_cleanup，仅返回一张
+    // 合成票据，保持 cleanup_when_expendable / registered_snapshot_ticket
+    // 降级路径的类型与流程一致（票据不对应任何磁盘状态）。
+    #[cfg(not(unix))]
+    {
+        let entry = PendingCleanupEntry {
+            managed_id: context.managed_id.clone(),
+            path: context.root.clone(),
+            device: 0,
+            inode: 0,
+            marker: context.managed_id.clone(),
+        };
+        let manifest_raw = pending_cleanup_manifest_bytes(
+            vec![entry.clone()],
+            PendingCleanupDisposition::ActiveRecovery,
+        )
+        .map_err(|_| context.register_error("无法编码降级事务快照清单。"))?;
+        return Ok(RegisteredAuthorityCleanup { manifest_raw, entry });
+    }
     if context.root.parent() != Some(context.expected_snapshot_parent.as_path())
         || context.root.file_name().and_then(|name| name.to_str())
             != Some(context.managed_id.as_str())
@@ -455,14 +489,14 @@ pub(super) fn register_authority_cleanup(
         return Err(context.register_error("事务快照创建身份缺失。"));
     };
     if !before.is_dir()
-        || before.uid() != unsafe { libc::geteuid() }
-        || before.permissions().mode() & 0o777 != 0o700
+        || before.uid() != unsafe { crate::platform::geteuid() }
+        || !crate::platform::dir_mode_is_0700(&before)
         || before.dev() != expected_device
         || before.ino() != expected_inode
         || !AuthorityTreeSnapshot::destination_entry_matches_file(
             &before_entry,
             &before,
-            libc::S_IFDIR,
+            crate::platform::S_IFDIR,
         )
     {
         return Err(context.register_error("事务快照身份不安全。"));
@@ -473,19 +507,19 @@ pub(super) fn register_authority_cleanup(
             let mut marker = AuthorityTreeSnapshot::open_destination_at(
                 root.as_raw_fd(),
                 &marker_name,
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                crate::platform::O_WRONLY | crate::platform::O_CREAT | crate::platform::O_EXCL,
                 0o600,
             )
             .map_err(|_| context.register_error("无法创建事务快照 marker。"))?;
             std::io::Write::write_all(&mut marker, format!("{}\n", context.managed_id).as_bytes())
-                .and_then(|_| marker.set_permissions(std::fs::Permissions::from_mode(0o600)))
+                .and_then(|_| marker.set_permissions(crate::platform::permissions_from_mode(0o600)))
                 .and_then(|_| marker.sync_all())
                 .map_err(|_| context.register_error("无法持久化事务快照 marker。"))?;
             let metadata = marker
                 .metadata()
                 .map_err(|_| context.register_error("无法复核事务快照 marker。"))?;
             if !metadata.is_file()
-                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.uid() != unsafe { crate::platform::geteuid() }
                 || metadata.permissions().mode() & 0o777 != 0o600
                 || metadata.nlink() != 1
                 || metadata.len() > 256
@@ -500,7 +534,7 @@ pub(super) fn register_authority_cleanup(
             let mut marker = AuthorityTreeSnapshot::open_destination_at(
                 root.as_raw_fd(),
                 &marker_name,
-                libc::O_RDONLY,
+                crate::platform::O_RDONLY,
                 0,
             )
             .map_err(|_| context.register_error("事务快照 marker 身份不安全。"))?;
@@ -508,7 +542,7 @@ pub(super) fn register_authority_cleanup(
                 .metadata()
                 .map_err(|_| context.register_error("事务快照 marker 身份不安全。"))?;
             if !metadata.is_file()
-                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.uid() != unsafe { crate::platform::geteuid() }
                 || metadata.permissions().mode() & 0o777 != 0o600
                 || metadata.nlink() != 1
                 || metadata.len() > 256
@@ -533,12 +567,12 @@ pub(super) fn register_authority_cleanup(
     if after.dev() != before.dev()
         || after.ino() != before.ino()
         || !after.is_dir()
-        || after.uid() != unsafe { libc::geteuid() }
-        || after.permissions().mode() & 0o777 != 0o700
+        || after.uid() != unsafe { crate::platform::geteuid() }
+        || !crate::platform::dir_mode_is_0700(&after)
         || !AuthorityTreeSnapshot::destination_entry_matches_file(
             &after_entry,
             &after,
-            libc::S_IFDIR,
+            crate::platform::S_IFDIR,
         )
     {
         return Err(context.register_error("事务快照在注册期间发生变化。"));
@@ -683,10 +717,18 @@ pub(super) fn retry_completed_pending_cleanup_clear(
     Ok(PendingCleanupClearRetryOutcome::Published)
 }
 
+#[allow(unreachable_code)]
 pub(super) fn finalize_registered_authority_cleanup(
     context: &AuthorityCleanupContext,
     ticket: &RegisteredAuthorityCleanup,
 ) -> Result<AuthorityCleanupOutcome, AuthorityCleanupFailure> {
+    // Windows 降级 finalize：降级模式下没有快照目录可删除、没有 pending
+    // 清单需要 CLEAR，也没有可复验的 dev/inode 身份；直接视为已清理。
+    #[cfg(not(unix))]
+    {
+        let _ = (context, ticket);
+        return Ok(AuthorityCleanupOutcome::Cleared);
+    }
     let manifest_raw = config::read_pending_authority_cleanup_manifest(&context.config_dir)
         .map_err(|_| {
             cleanup_failure("cleanup_manifest_read_failed：无法安全读取刚注册的待清理事务清单。")
@@ -748,10 +790,21 @@ pub(super) fn finalize_registered_authority_cleanup(
     Ok(AuthorityCleanupOutcome::Cleared)
 }
 
+#[allow(unreachable_code)]
 pub(super) fn prepare_registered_authority_cleanup(
     context: &AuthorityCleanupContext,
     ticket: &RegisteredAuthorityCleanup,
 ) -> Result<RegisteredAuthorityCleanup, AuthorityCleanupFailure> {
+    // Windows 降级 prepare：ActiveRecovery -> CleanupOnly 是 pending 清单的
+    // CAS 转换；降级模式没有清单，票据原样透传（身份字段不变）。
+    #[cfg(not(unix))]
+    {
+        let _ = context;
+        return Ok(RegisteredAuthorityCleanup {
+            manifest_raw: ticket.manifest_raw.clone(),
+            entry: ticket.entry.clone(),
+        });
+    }
     let current = config::read_pending_authority_cleanup_manifest(&context.config_dir)
         .map_err(|_| cleanup_failure("cleanup_manifest_read_failed：无法读取活动恢复快照清单。"))?
         .ok_or_else(|| cleanup_failure("cleanup_manifest_missing：活动恢复快照清单不存在。"))?;
@@ -1085,8 +1138,8 @@ pub(super) fn registered_authority_snapshot_for_ticket(
         .metadata()
         .map_err(|_| retry_failure("cleanup_identity_invalid：无法复核 history snapshot。"))?;
     if !metadata.is_dir()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.permissions().mode() & 0o777 != 0o700
+        || metadata.uid() != unsafe { crate::platform::geteuid() }
+        || !crate::platform::dir_mode_is_0700(&metadata)
         || metadata.dev() != entry.device
         || metadata.ino() != entry.inode
     {
@@ -1250,16 +1303,17 @@ pub(super) fn remove_authority_snapshot_root(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
         };
-    let identity_matches = |current: &libc::stat| {
-        current.st_mode & libc::S_IFMT == libc::S_IFDIR
+    let identity_matches = |current: &crate::platform::Stat| {
+        current.st_mode & crate::platform::S_IFMT == crate::platform::S_IFDIR
             && u64::try_from(current.st_dev).ok() == Some(entry.device)
             && inode_u64(current.st_ino) == Some(entry.inode)
             && u32::from(current.st_mode) & 0o777 == 0o700
-            && current.st_uid == unsafe { libc::geteuid() }
+            && current.st_uid == unsafe { crate::platform::geteuid() }
     };
     match (inspect(&name)?, inspect(&tombstone_name)?) {
         (None, None) => return sync_authority_cleanup_parent(&parent),
         (Some(current), None) if identity_matches(&current) => {
+            #[cfg(unix)]
             let renamed = unsafe {
                 libc::renameat(
                     parent.as_raw_fd(),
@@ -1268,6 +1322,9 @@ pub(super) fn remove_authority_snapshot_root(
                     tombstone_name.as_ptr(),
                 )
             };
+            // Windows 降级：renameat 无等价物；该分支只会经上游 Unsupported 错误到达。
+            #[cfg(not(unix))]
+            let renamed: i32 = -1;
             if renamed != 0 {
                 return Err(std::io::Error::last_os_error());
             }

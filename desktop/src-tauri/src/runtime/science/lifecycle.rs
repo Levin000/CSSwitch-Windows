@@ -1,3 +1,10 @@
+#[cfg(windows)]
+fn process_text_paths(pid: u32) -> Option<Vec<PathBuf>> {
+    // Windows 移植：无 lsof；用进程可执行文件路径做同等身份比较。
+    crate::platform::process_image_path(pid).map(|path| vec![path])
+}
+
+#[cfg(unix)]
 fn process_text_paths(pid: u32) -> Option<Vec<PathBuf>> {
     let pid_text = pid.to_string();
     let text_files = Command::new("/usr/sbin/lsof")
@@ -11,7 +18,7 @@ fn process_text_paths(pid: u32) -> Option<Vec<PathBuf>> {
         String::from_utf8_lossy(&text_files.stdout)
             .lines()
             .filter_map(|line| line.strip_prefix('n'))
-            .filter_map(|path| Path::new(path).canonicalize().ok())
+            .filter_map(|path| Path::new(path).canonicalize_norm().ok())
             .collect(),
     )
 }
@@ -28,7 +35,7 @@ fn listener_runtime_pid(port: u16, runtime: &ScienceRuntimeIdentity) -> Option<u
             return Some(pid);
         }
     }
-    let expected = runtime.path.canonicalize().ok()?;
+    let expected = runtime.path.canonicalize_norm().ok()?;
     process_text_paths(pid)?
         .into_iter()
         .any(|path| path == expected)
@@ -50,8 +57,8 @@ fn test_listener_marker_matches(pid: &str, runtime: &ScienceRuntimeIdentity) -> 
     }
     let explicit_matches = std::env::var_os("SCIENCE_BIN")
         .map(PathBuf::from)
-        .and_then(|configured| configured.canonicalize().ok())
-        == runtime.path.canonicalize().ok();
+        .and_then(|configured| configured.canonicalize_norm().ok())
+        == runtime.path.canonicalize_norm().ok();
     let updater_snapshot_matches = fake_science_updater_identity_armed_for_current_thread()
         && runtime.source == ScienceRuntimeSource::OfficialUpdated;
     if !explicit_matches && !updater_snapshot_matches {
@@ -426,8 +433,8 @@ fn execute_science_stop_inner<R: Runtime>(
             Some(root) => {
                 let stop = root.join("scripts/stop-science-sandbox.sh");
                 if stop.is_file() {
-                    let mut stop_cmd = Command::new("zsh");
-                    stop_cmd.arg(&stop);
+                    let mut stop_cmd = Command::new(crate::runtime::launch_env::science_script_shell());
+                    stop_cmd.arg(crate::platform::bash_path(&stop));
                     crate::runtime::launch_env::configure_science_stop_script_command(
                         &mut stop_cmd,
                         &sandbox_home(),
@@ -484,7 +491,7 @@ fn execute_science_stop_inner<R: Runtime>(
                 // were proved both before and after CLI.
                 // SAFETY: kill does not dereference pointers. PID > 1 and exact
                 // listener identity were checked immediately above.
-                if unsafe { libc::kill(pid as i32, libc::SIGTERM) } != 0 {
+                if unsafe { crate::platform::kill(pid as i32, libc::SIGTERM) } != 0 {
                     failure = Some(ScienceStopFailure::signal_failure(
                         "Science CLI 后精确 daemon 无法接收 TERM。",
                     ));
@@ -504,7 +511,7 @@ fn execute_science_stop_inner<R: Runtime>(
                         SciencePostTermAction::KillExact => {
                             // SAFETY: the same launch token, including process-start
                             // identity, is revalidated after the TERM wait.
-                            let _ = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+                            let _ = unsafe { crate::platform::kill(pid as i32, crate::platform::SIGKILL) };
                             for _ in 0..20 {
                                 if !loopback_port_accepts_tcp(sandbox_port) {
                                     break;

@@ -881,6 +881,11 @@ impl OneClickFailure {
 // launch budget.
 const SCIENCE_DB_REVERIFY_BUDGET_MS: u64 = 305_000;
 const SCIENCE_DB_RECOVERY_RESTART_BUDGET_MS: u64 = 30 * 60 * 1_000 + 10_000;
+// Windows 移植：守护进程冷启动要恢复 conda/MCP 预热（可达一两分钟），
+// 20s 引导预算会耗尽；放宽到 120s。macOS 保持原值。
+#[cfg(windows)]
+const SCIENCE_HEALTH_BOOTSTRAP_BUDGET_MS: u64 = 120_000;
+#[cfg(not(windows))]
 const SCIENCE_HEALTH_BOOTSTRAP_BUDGET_MS: u64 = 20_000;
 
 fn science_db_reverify_budget_ms() -> u64 {
@@ -937,7 +942,10 @@ pub(super) fn science_health_control_error(
     {
         "science_api_health_unreachable".into()
     } else {
-        format!("science_api_health_control_failed code={}", error.code)
+        format!(
+            "science_api_health_control_failed code={} detail={}",
+            error.code, error.message
+        )
     }
 }
 

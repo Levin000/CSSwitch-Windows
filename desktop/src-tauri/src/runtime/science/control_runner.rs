@@ -48,7 +48,7 @@ impl ScienceControlOutput {
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .custom_flags(crate::platform::O_NOFOLLOW | crate::platform::O_CLOEXEC)
                 .open(&path)
             {
                 Ok(file) => return Some(Self { file, path }),
@@ -97,6 +97,7 @@ impl Drop for ScienceControlOutput {
     }
 }
 
+#[cfg(unix)]
 fn anchored_science_control_child_exited(pid: u32) -> Result<bool, i32> {
     let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
     loop {
@@ -122,6 +123,35 @@ fn anchored_science_control_child_exited(pid: u32) -> Result<bool, i32> {
     }
 }
 
+#[cfg(not(unix))]
+// Windows 移植：无 waitid(WNOWAIT)。用 OpenProcess + GetExitCodeProcess 观测
+// 退出状态：子进程未被 reap 前退出码不再是 STILL_ACTIVE 即视为已退出
+// （等价 WNOHANG|WNOWAIT 的观测语义，不做进程组锚定）。
+fn anchored_science_control_child_exited(pid: u32) -> Result<bool, i32> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    const STILL_ACTIVE: u32 = 259;
+    unsafe {
+        // SAFETY: handle 仅为本次查询而打开，查询后立即关闭。
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            // 打不开：子进程已退出（原 WNOWAIT 锚定随之消失）或权限不足。
+            // 返回「已退出」，交给上层 try_wait 复核真实退出码，避免把
+            // 正常完成的子进程误判为 Wait 失败。
+            return Ok(true);
+        }
+        let mut exit_code: u32 = 0;
+        let ok = GetExitCodeProcess(handle, &mut exit_code);
+        CloseHandle(handle);
+        if ok == 0 {
+            return Err(0);
+        }
+        Ok(exit_code != STILL_ACTIVE)
+    }
+}
+
 fn kill_anchored_science_control_group(pid: u32, leader_exited: bool, force_failure: bool) -> bool {
     if force_failure {
         return false;
@@ -131,7 +161,7 @@ fn kill_anchored_science_control_group(pid: u32, leader_exited: bool, force_fail
     };
     // SAFETY: the child was spawned with process_group(0), and the live or
     // WNOWAIT-observed leader keeps this exact pid/pgid reserved.
-    if unsafe { libc::kill(-pgid, libc::SIGKILL) } == 0 {
+    if unsafe { crate::platform::kill(-pgid, crate::platform::SIGKILL) } == 0 {
         return true;
     }
     let errno = std::io::Error::last_os_error().raw_os_error();
@@ -337,25 +367,31 @@ pub(crate) fn run_bounded_control_command(
     #[cfg(not(test))]
     let force_group_kill_failure = false;
 
-    command
-        .stdout(stdout_stdio)
-        .stderr(stderr_stdio)
-        .process_group(0);
-    // SAFETY: setrlimit is async-signal-safe and the closure captures only a
-    // copyable integer. The limit is inherited by all descendants.
-    unsafe {
-        command.pre_exec(move || {
-            let limit = libc::rlimit {
-                rlim_cur: file_limit as libc::rlim_t,
-                rlim_max: file_limit as libc::rlim_t,
-            };
-            if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) == 0 {
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error())
-            }
-        });
+    command.stdout(stdout_stdio).stderr(stderr_stdio);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+        // SAFETY: setrlimit is async-signal-safe and the closure captures only a
+        // copyable integer. The limit is inherited by all descendants.
+        unsafe {
+            command.pre_exec(move || {
+                let limit = libc::rlimit {
+                    rlim_cur: file_limit as libc::rlim_t,
+                    rlim_max: file_limit as libc::rlim_t,
+                };
+                if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
     }
+    // Windows 降级：无 process_group/pre_exec(RLIMIT_FSIZE)；子进程输出上限仍由
+    // 读取侧 BoundedControlCommand 限额兜底。
+    #[cfg(not(unix))]
+    let _ = file_limit;
     let completion_deadline = deadline
         .checked_add(SCIENCE_CONTROL_SUPERVISOR_GRACE)
         .unwrap_or(deadline);

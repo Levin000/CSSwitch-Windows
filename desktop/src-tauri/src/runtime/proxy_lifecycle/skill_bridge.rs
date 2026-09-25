@@ -143,8 +143,9 @@ pub(crate) fn current_skill_install_bridge_key() -> Result<PathBuf, String> {
     }
     #[cfg(unix)]
     {
+        #[cfg(unix)]
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        if metadata.uid() != unsafe { libc::geteuid() }
+        if metadata.uid() != unsafe { crate::platform::geteuid() }
             || metadata.permissions().mode() & 0o077 != 0
         {
             return Err("CSSwitch 私有 Skill bridge key file 权限非法".into());
@@ -171,12 +172,12 @@ impl PreparedSkillInstallBridgeKey {
             .map_err(|_| "无法提交 CSSwitch 私有 Skill bridge key")?;
         #[cfg(unix)]
         {
+            #[cfg(unix)]
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&self.key_file, fs::Permissions::from_mode(0o600))
+            fs::set_permissions(&self.key_file, crate::platform::permissions_from_mode(0o600))
                 .map_err(|_| "无法收紧 CSSwitch 私有 Skill bridge key 权限")?;
         }
-        File::open(&self.runtime_dir)
-            .and_then(|directory| directory.sync_all())
+        crate::platform::sync_directory(&self.runtime_dir)
             .map_err(|_| "无法同步 CSSwitch 私有 Skill bridge key 目录")?;
         self.temporary = None;
         Ok(self.key_file.clone())
@@ -225,6 +226,7 @@ fn stage_skill_install_bridge_key_at(
         options.write(true).create_new(true);
         #[cfg(unix)]
         {
+            #[cfg(unix)]
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }

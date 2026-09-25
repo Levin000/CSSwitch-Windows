@@ -11,11 +11,7 @@ fn is_executable_file(path: &Path) -> bool {
             Err(_) => return false,
         }
     }
-    path.is_file()
-        && path
-            .metadata()
-            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
+    path.is_file() && path.metadata().map(|metadata| crate::platform::mode_has_exec(&metadata)).unwrap_or(false)
 }
 
 fn is_explicit_executable_file(path: &Path) -> bool {
@@ -88,7 +84,7 @@ fn official_updated_identity_metadata_matches(path: &Path) -> bool {
 fn file_is_macho(path: &Path) -> bool {
     let file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(crate::platform::O_NOFOLLOW | crate::platform::O_CLOEXEC)
         .open(path);
     let Ok(mut file) = file else {
         return false;
@@ -114,7 +110,7 @@ fn official_updated_science_bin_for_home(
     home: &Path,
     verify_local_identity: bool,
 ) -> Option<PathBuf> {
-    if !home.is_absolute() || home.canonicalize().ok().as_deref() != Some(home) {
+    if !home.is_absolute() || home.canonicalize_norm().ok().as_deref() != Some(home) {
         return None;
     }
     let science_dir = home.join(".claude-science");
@@ -124,7 +120,7 @@ fn official_updated_science_bin_for_home(
         return None;
     }
     // SAFETY: geteuid has no preconditions and does not dereference pointers.
-    let uid = unsafe { libc::geteuid() };
+    let uid = unsafe { crate::platform::geteuid() };
     for directory in [home, &science_dir, &bin_dir] {
         let metadata = directory.symlink_metadata().ok()?;
         if !metadata.file_type().is_dir()
@@ -182,20 +178,20 @@ fn secure_runtime_snapshot_root(root: &Path) -> Result<PathBuf, String> {
     fs::create_dir_all(root)
         .map_err(|error| format!("创建 Science runtime snapshot 目录失败：{error}"))?;
     let canonical = root
-        .canonicalize()
+        .canonicalize_norm()
         .map_err(|error| format!("确认 Science runtime snapshot 目录失败：{error}"))?;
     if canonical != root {
         return Err("Science runtime snapshot 目录包含 symlink，已拒绝使用".into());
     }
     // SAFETY: geteuid has no preconditions and does not dereference pointers.
-    let uid = unsafe { libc::geteuid() };
+    let uid = unsafe { crate::platform::geteuid() };
     let metadata = root
         .symlink_metadata()
         .map_err(|error| format!("读取 Science runtime snapshot 目录失败：{error}"))?;
     if !metadata.file_type().is_dir() || metadata.uid() != uid {
         return Err("Science runtime snapshot 目录属主或权限不安全".into());
     }
-    fs::set_permissions(root, fs::Permissions::from_mode(0o700))
+    fs::set_permissions(root, crate::platform::permissions_from_mode(0o700))
         .map_err(|error| format!("收紧 Science runtime snapshot 目录权限失败：{error}"))?;
     Ok(canonical)
 }
@@ -211,13 +207,13 @@ fn official_updated_snapshot_from_process_paths(
         Err(error) => return Err(format!("读取 Science runtime snapshot 目录失败：{error}")),
     };
     // SAFETY: geteuid has no preconditions and does not dereference pointers.
-    let uid = unsafe { libc::geteuid() };
+    let uid = unsafe { crate::platform::geteuid() };
     if !snapshot_root.is_absolute()
         || metadata.file_type().is_symlink()
         || !metadata.file_type().is_dir()
         || metadata.uid() != uid
         || metadata.permissions().mode() & 0o022 != 0
-        || snapshot_root.canonicalize().ok().as_deref() != Some(snapshot_root)
+        || snapshot_root.canonicalize_norm().ok().as_deref() != Some(snapshot_root)
     {
         return Err("Science runtime snapshot 目录身份或权限不安全".into());
     }
@@ -249,7 +245,7 @@ fn official_updated_snapshot_from_process_paths(
         || metadata.permissions().mode() & 0o111 == 0
         || metadata.permissions().mode() & 0o022 != 0
         || !(MIN_SCIENCE_BINARY_SIZE..=MAX_SCIENCE_BINARY_SIZE).contains(&metadata.len())
-        || path.canonicalize().ok().as_deref() != Some(path.as_path())
+        || path.canonicalize_norm().ok().as_deref() != Some(path.as_path())
     {
         return Err("Science runtime snapshot 文件身份或权限不安全".into());
     }
@@ -294,7 +290,7 @@ fn snapshot_science_executable(
 ) -> Result<PathBuf, String> {
     let mut source = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(crate::platform::O_NOFOLLOW | crate::platform::O_CLOEXEC)
         .open(candidate)
         .map_err(|error| format!("打开 {source_label} Science executable 失败：{error}"))?;
     let source_before = source
@@ -322,7 +318,7 @@ fn snapshot_science_executable(
             .write(true)
             .create_new(true)
             .mode(0o500)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .custom_flags(crate::platform::O_NOFOLLOW | crate::platform::O_CLOEXEC)
             .open(&temporary)
             .map_err(|error| format!("创建 Science runtime snapshot 临时文件失败：{error}"))?;
         let mut digest = Sha256::new();
@@ -364,7 +360,7 @@ fn snapshot_science_executable(
                 "{source_label} Science executable 在快照期间发生变化；请重试"
             ));
         }
-        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o500))
+        fs::set_permissions(&temporary, crate::platform::permissions_from_mode(0o500))
             .map_err(|error| format!("收紧 Science runtime snapshot 权限失败：{error}"))?;
         if !verify_snapshot_identity(&temporary) {
             return Err(format!(
@@ -395,8 +391,14 @@ fn snapshot_science_executable(
                 return Err(format!("提交 Science runtime snapshot 失败：{error}"));
             }
         };
+        if !created {
+            // Windows 移植：既有快照可能由旧版本以可写属性创建；重申 0o500
+            // 收紧（幂等，Unix 上原文件本应已是 0500，重设无害）。
+            fs::set_permissions(&snapshot, crate::platform::permissions_from_mode(0o500))
+                .map_err(|error| format!("收紧 Science runtime snapshot 权限失败：{error}"))?;
+        }
         if created {
-            match fs::remove_file(&temporary) {
+            match crate::platform::remove_file_force(&temporary) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
@@ -405,6 +407,10 @@ fn snapshot_science_executable(
                     ))
                 }
             }
+            // Windows 移植：hard link 共享文件记录，remove_file_force 为删除
+            // 而清除的只读属性同样作用于快照；删除临时链接后重新收紧。
+            fs::set_permissions(&snapshot, crate::platform::permissions_from_mode(0o500))
+                .map_err(|error| format!("收紧 Science runtime snapshot 权限失败：{error}"))?;
         }
         let mut snapshot_metadata = snapshot
             .symlink_metadata()
@@ -416,7 +422,7 @@ fn snapshot_science_executable(
                 .map_err(|error| format!("复核 Science runtime snapshot 身份失败：{error}"))?;
         }
         if !snapshot_metadata.file_type().is_file()
-            || snapshot_metadata.uid() != unsafe { libc::geteuid() }
+            || snapshot_metadata.uid() != unsafe { crate::platform::geteuid() }
             || snapshot_metadata.permissions().mode() & 0o777 != 0o500
             || snapshot_metadata.nlink() != 1
             || snapshot_metadata.len() != source_after.size()
@@ -431,12 +437,14 @@ fn snapshot_science_executable(
         {
             return Err("Science runtime snapshot 内容或权限与已验证候选不一致".into());
         }
+        #[cfg(unix)]
         File::open(&snapshot_root)
             .and_then(|directory| directory.sync_all())
             .map_err(|error| format!("持久化 Science runtime snapshot 目录失败：{error}"))?;
+        // Windows 无目录句柄 fsync；数据已随文件 sync_all 落盘（注释降级）。
         Ok(snapshot)
     })();
-    let _ = fs::remove_file(&temporary);
+    let _ = crate::platform::remove_file_force(&temporary);
     result
 }
 
@@ -468,7 +476,7 @@ fn remove_science_snapshot_temp_links(root: &Path, snapshot: &Path) -> Result<()
             }
         };
         if metadata.file_type().is_file()
-            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.uid() == unsafe { crate::platform::geteuid() }
             && metadata.dev() == snapshot_metadata.dev()
             && metadata.ino() == snapshot_metadata.ino()
         {
@@ -540,6 +548,38 @@ fn installed_app_snapshot(
     .map(Some)
 }
 
+/// 平台感知的「已安装 Claude Science App」固定路径。
+/// Unix 沿用编译期常量 SCIENCE_BIN（macOS App Bundle 内的 CLI）。
+/// Windows 安装器布局未知，按常见 NSIS/Electron 布局探测候选；可用
+/// `CSSWITCH_SCIENCE_APP_BIN` 显式指定绝对路径覆盖。找不到返回 None。
+fn installed_app_fixed_bin() -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        Some(PathBuf::from(SCIENCE_BIN))
+    }
+    #[cfg(not(unix))]
+    {
+        if let Some(explicit) = std::env::var_os("CSSWITCH_SCIENCE_APP_BIN") {
+            let path = PathBuf::from(explicit);
+            if path.is_absolute() {
+                return Some(path);
+            }
+        }
+        let local = std::env::var_os("LOCALAPPDATA")?;
+        let base = PathBuf::from(local).join("Programs");
+        let candidates = [
+            base.join("Claude Science")
+                .join("resources")
+                .join("bin")
+                .join("claude-science.exe"),
+            base.join("Claude Science").join("claude-science.exe"),
+            base.join("claude-science").join("claude-science.exe"),
+            base.join("ClaudeScience").join("claude-science.exe"),
+        ];
+        candidates.into_iter().find(|c| c.is_file())
+    }
+}
+
 fn official_updated_science_bin() -> Result<Option<PathBuf>, String> {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return Ok(None);
@@ -554,11 +594,11 @@ fn science_executable_fingerprint(path: &Path) -> Option<ScienceExecutableFinger
     }
     let mut file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(crate::platform::O_NOFOLLOW | crate::platform::O_CLOEXEC)
         .open(path)
         .ok()?;
     let before = file.metadata().ok()?;
-    if !before.file_type().is_file() || before.permissions().mode() & 0o111 == 0 {
+    if !before.file_type().is_file() || !crate::platform::mode_has_exec(&before) {
         return None;
     }
     let mut digest = Sha256::new();
@@ -677,7 +717,7 @@ pub(crate) fn runtime_identity_from_durable_parts(
         _ => return Err("durable prior Science recipe has an unknown runtime source".into()),
     };
     let canonical = runtime_path
-        .canonicalize()
+        .canonicalize_norm()
         .map_err(|_| "durable prior Science runtime is unavailable")?;
     if canonical != runtime_path {
         return Err("durable prior Science runtime path is not canonical".into());
@@ -762,7 +802,13 @@ fn preferred_science_runtime_candidate(
         return Ok(None);
     }
 
-    let app = PathBuf::from(SCIENCE_BIN);
+    // Windows 移植：固定路径按平台解析；找不到已安装 App 时安静返回 None
+    //（由上层报告「未安装」），不再把 macOS 路径常量硬套到 Windows 触发
+    // 「固定路径不是绝对路径」。
+    let app = match installed_app_fixed_bin() {
+        Some(path) => path,
+        None => return Ok(None),
+    };
     if let Some(runtime) = runtime_identity(
         app.clone(),
         ScienceRuntimeSource::InstalledApp,

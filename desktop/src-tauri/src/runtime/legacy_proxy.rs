@@ -2,6 +2,7 @@ use std::path::Path;
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
+use crate::platform::CanonicalizeExt;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ListenerProcess {
@@ -215,7 +216,7 @@ pub(crate) fn stop_legacy_csswitch_python_on_port(
         process,
         |expected| exact_legacy_listener(port, expected_script).as_ref() == Some(expected),
         |pid| {
-            let result = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+            let result = unsafe { crate::platform::kill(pid as i32, libc::SIGTERM) };
             (result == 0).then_some(()).ok_or(())
         },
         |pid| {
@@ -266,7 +267,7 @@ where
     F: Fn() -> bool,
 {
     stop_managed_gateway_on_port_with(port, expected_binary, health_still_matches, |pid| {
-        let result = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+        let result = unsafe { crate::platform::kill(pid as i32, libc::SIGTERM) };
         if result == 0 {
             Ok(())
         } else {
@@ -299,12 +300,12 @@ where
     if pid <= 1 || process.uid != uid {
         return ManagedGatewayCleanup::NotManaged;
     }
-    let Ok(expected) = expected_binary.canonicalize() else {
+    let Ok(expected) = expected_binary.canonicalize_norm() else {
         return ManagedGatewayCleanup::NotManaged;
     };
     let executable_matches = process_text_files(pid)
         .into_iter()
-        .filter_map(|path| path.canonicalize().ok())
+        .filter_map(|path| path.canonicalize_norm().ok())
         .any(|path| path == expected);
     if !executable_matches
         || !health_still_matches()

@@ -21,6 +21,7 @@ mod oauth_forge;
 mod opencode_go_models;
 mod proc;
 mod provider_contracts;
+mod platform;
 mod runtime;
 mod scratch;
 mod templates;
@@ -1096,6 +1097,8 @@ pub fn run() {
         .expect("error while building tauri application");
 
     app.run(|app, event| match event {
+        // Reopen is the macOS dock-click event; the variant only exists there.
+        #[cfg(target_os = "macos")]
         tauri::RunEvent::Reopen { .. } => show_main_window(app),
         tauri::RunEvent::ExitRequested { api, .. } => {
             if matches!(

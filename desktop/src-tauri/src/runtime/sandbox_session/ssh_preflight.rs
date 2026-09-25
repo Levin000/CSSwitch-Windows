@@ -1,7 +1,18 @@
 //! SSH preflight for one-click / running-bridge validation.
+#[cfg(not(unix))]
+use std::os::windows::fs::OpenOptionsExt as _;
+
+#[cfg(not(unix))]
+use crate::platform::UnixCompatExt;
+#[cfg(not(unix))]
+use crate::platform::OpenOptionsModeExt;
+#[cfg(not(unix))]
+use std::os::windows::fs::OpenOptionsExt as _;
+
 use crate::config;
 use crate::runtime::system::asset_root;
 use std::io::Read;
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use tauri::Runtime;
@@ -35,7 +46,7 @@ pub(super) fn validate_system_ssh_wrapper_path<R: Runtime>(
     };
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .custom_flags(crate::platform::O_NOFOLLOW | crate::platform::O_NONBLOCK | crate::platform::O_CLOEXEC)
         .open(&wrapper)
         .map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
@@ -50,7 +61,7 @@ pub(super) fn validate_system_ssh_wrapper_path<R: Runtime>(
     let named = std::fs::symlink_metadata(&wrapper)
         .map_err(|_| "打包的 CSSwitch SSH bridge 缺失".to_string())?;
     // SAFETY: geteuid has no preconditions and does not dereference pointers.
-    let uid = unsafe { libc::geteuid() };
+    let uid = unsafe { crate::platform::geteuid() };
     let mode = opened.permissions().mode();
     if !opened.file_type().is_file()
         || named.file_type().is_symlink()

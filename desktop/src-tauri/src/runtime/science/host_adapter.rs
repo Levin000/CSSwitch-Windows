@@ -353,9 +353,9 @@ impl ScienceHostAdapter {
                 ScienceEnvironmentExposure::NotExposed,
             ));
         }
-        let mut command = Command::new("zsh");
+        let mut command = Command::new(crate::runtime::launch_env::science_script_shell());
         command
-            .arg(spec.launch_script)
+            .arg(crate::platform::bash_path(spec.launch_script))
             .arg("--port")
             .arg(spec.port.to_string())
             .arg("--skip-oauth-forge");
@@ -367,8 +367,16 @@ impl ScienceHostAdapter {
                 proxy_url: spec.proxy_url,
                 reuse_system_ssh: spec.reuse_system_ssh,
                 system_ssh_hosts: spec.system_ssh_hosts,
-                opaque_bindings: spec.opaque_bindings,
-                runtime_version_prechecked: true,
+                // Windows 降级：不下发 opaque 绑定（dev/inode 锚定在 Windows 上
+                // 不可观测，启动脚本侧相应跳过绑定校验），也不声明
+                // runtime_version_prechecked（让移植版启动脚本自己做 --version
+                // 预检），避免二次启动时 conda/runtime 等目录已存在导致拒绝。
+                opaque_bindings: if cfg!(unix) {
+                    spec.opaque_bindings
+                } else {
+                    None
+                },
+                runtime_version_prechecked: cfg!(unix),
                 acceptance_outer_sandbox,
             },
         );

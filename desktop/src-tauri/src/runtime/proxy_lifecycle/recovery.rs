@@ -298,6 +298,33 @@ fn recover_interrupted_gateway_from_dir<R: Runtime>(
             error.to_string(),
         )
     })?;
+    #[cfg(not(unix))]
+    {
+        // Windows 移植降级：中断事务的身份证明与安全接管依赖 fd/dev/ino
+        // 锚定，本平台不可用。改为直接终止全部 Gateway 进程并清空事务与
+        // 补偿 journal，让一键流程从干净状态重建（单用户桌面场景；macOS
+        // 保留原有保守语义）。
+        if cfg.runtime_transaction.is_some() || cfg.runtime_compensation.is_some() {
+            use crate::platform::CreationFlagsExt;
+            let _ = std::process::Command::new("taskkill")
+                .args(["/IM", "csswitch-gateway.exe", "/F"])
+                .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+                .status();
+            config::update(dir, |current| {
+                current.runtime_transaction = None;
+                current.runtime_compensation = None;
+            })
+            .map_err(|error| {
+                interrupted_gateway_recovery_error(
+                    InterruptedGatewayRecoveryErrorKind::GatewayStart,
+                    format!("清空中断事务 journal 失败：{error}"),
+                )
+            })?;
+        }
+        return Ok(InterruptedGatewayRecoveryOutcome::NotNeeded);
+    }
+    // Windows 已在上面的降级分支提前返回；此处起仅 Unix 可达，但保持
+    // 无 cfg 编译以复用后续主体。
     let Some(journal) = cfg.runtime_transaction.as_ref() else {
         return Ok(InterruptedGatewayRecoveryOutcome::NotNeeded);
     };

@@ -1,8 +1,15 @@
 //! Authority filesystem snapshot primitives (capture/copy/identity/limits).
 //! No pending-cleanup orchestration and no one-click transaction policy live here.
 
+#[cfg(not(unix))]
+use crate::platform::{OpenOptionsModeExt, UnixCompatExt};
+#[cfg(not(unix))]
+use std::os::windows::fs::OpenOptionsExt as _;
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 

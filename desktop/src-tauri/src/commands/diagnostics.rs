@@ -108,11 +108,15 @@ fn run_doctor_read_only_cmd<R: tauri::Runtime>(
         None => (String::new(), String::new(), "", false),
     };
     let gateway = crate::runtime::proxy_lifecycle::doctor_gateway_bin_path(app);
-    let mut cmd = Command::new("/bin/bash");
+    let mut cmd = Command::new(if cfg!(target_os = "windows") {
+        crate::runtime::launch_env::science_script_shell()
+    } else {
+        "/bin/bash".to_string()
+    });
     harden_doctor_command(&mut cmd, &config_path, gateway.as_deref());
     // 多 profile：传 template_id + adapter + key 有无（布尔）。doctor 不再按 provider 名写死、
     // 不再去 shell 环境找 key（key 存 config.json）。绝不把真实 key 值传进其环境。
-    cmd.arg(&doctor)
+    cmd.arg(crate::platform::bash_path(&doctor))
         .env("CSSWITCH_PROVIDER", &provider_label)
         .env("CSSWITCH_ADAPTER", adapter)
         .env("CSSWITCH_AUTH_MODE", auth_mode)
@@ -217,7 +221,11 @@ pub(crate) fn report_bug() -> Result<(), String> {
 pub(crate) fn open_logs() -> Result<(), String> {
     let dir = config::default_dir().join("logs");
     let _ = std::fs::create_dir_all(&dir);
-    Command::new("open")
+    #[cfg(target_os = "windows")]
+    let opener = "explorer";
+    #[cfg(not(target_os = "windows"))]
+    let opener = "open";
+    Command::new(opener)
         .arg(&dir)
         .status()
         .map_err(|e| format!("打开日志目录失败：{e}"))?;

@@ -12,6 +12,10 @@ use std::process::Command;
 use crate::config;
 
 /// Fixed PATH for managed children. Do not inherit ambient PATH.
+#[cfg(target_os = "windows")]
+pub(crate) const SAFE_PATH: &str =
+    "C:\\Windows\\System32;C:\\Windows;C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\";
+#[cfg(not(target_os = "windows"))]
 pub(crate) const SAFE_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 
 /// Fixed locale for managed children.
@@ -62,20 +66,72 @@ where
 
 /// Minimal OS surface shared by Gateway, Science launch script, and stop script.
 pub(crate) fn base_process_env() -> Vec<(String, String)> {
-    vec![
+    let mut env = vec![
         ("PATH".into(), SAFE_PATH.into()),
         ("TMPDIR".into(), default_tmpdir()),
         ("LANG".into(), SAFE_LANG.into()),
         ("LC_ALL".into(), SAFE_LANG.into()),
-    ]
+    ];
+    #[cfg(target_os = "windows")]
+    {
+        // Windows 进程缺 SystemRoot 等系统变量时 CRT/Winsock 初始化会失败，
+        // 子进程可能直接崩溃。这些是 OS 运行必需项，不属于用户隐私泄漏面。
+        for key in [
+            "SystemRoot",
+            "SystemDrive",
+            "windir",
+            "ComSpec",
+            "PATHEXT",
+            "TEMP",
+            "TMP",
+        ] {
+            if let Some(value) = std::env::var_os(key) {
+                env.push((key.to_string(), value.to_string_lossy().into_owned()));
+            }
+        }
+    }
+    env
 }
 
 fn default_tmpdir() -> String {
     if cfg!(target_os = "macos") {
         "/private/tmp".into()
+    } else if cfg!(target_os = "windows") {
+        std::env::var("TEMP")
+            .or_else(|_| std::env::var("TMP"))
+            .unwrap_or_else(|_| "C:\\Windows\\Temp".into())
     } else {
         "/tmp".into()
     }
+}
+
+/// 打包 shell 脚本的解释器。Windows 上没有 zsh，统一用 Git Bash 的 bash
+/// 执行经过 bash 兼容化移植的脚本副本。裸调 "bash" 会经系统 PATH 解析到
+/// System32 的 WSL bash（把 C:/ 路径当 Linux 路径，报 No such file），
+/// 因此显式探测 Git Bash 安装位置；CSSWITCH_GIT_BASH 可覆盖。
+#[cfg(target_os = "windows")]
+pub(crate) fn science_script_shell() -> String {
+    if let Some(explicit) = std::env::var_os("CSSWITCH_GIT_BASH") {
+        let explicit = explicit.to_string_lossy().into_owned();
+        if std::path::Path::new(&explicit).is_file() {
+            return explicit;
+        }
+    }
+    for candidate in [
+        r"C:\Program Files\Git\bin\bash.exe",
+        r"C:\Program Files\Git\usr\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\usr\bin\bash.exe",
+    ] {
+        if std::path::Path::new(candidate).is_file() {
+            return candidate.to_string();
+        }
+    }
+    "bash".to_string()
+}
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn science_script_shell() -> &'static str {
+    "zsh"
 }
 
 /// Real user home that owns `~/.csswitch` (parent of config dir).

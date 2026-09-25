@@ -1,3 +1,13 @@
+#[cfg(not(unix))]
+use std::os::windows::fs::OpenOptionsExt as _;
+
+#[cfg(not(unix))]
+use crate::platform::UnixCompatExt;
+#[cfg(not(unix))]
+use crate::platform::OpenOptionsModeExt;
+#[cfg(not(unix))]
+use std::os::windows::fs::OpenOptionsExt as _;
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -72,6 +82,7 @@ pub(crate) fn log_path(name: &str) -> PathBuf {
 }
 
 /// Platform `O_NOFOLLOW` without adding libc. macOS/BSD=0x0100, Linux=0x20000.
+#[cfg(unix)]
 const fn libc_o_nofollow() -> i32 {
     if cfg!(target_os = "linux") {
         0x2_0000
@@ -80,14 +91,21 @@ const fn libc_o_nofollow() -> i32 {
     }
 }
 
+// Windows 降级：O_NOFOLLOW 不可表达，custom_flags 取 0。
+#[cfg(not(unix))]
+const fn libc_o_nofollow() -> u32 {
+    0
+}
+
 /// Open/truncate a child-process log, ensuring parent dir is 0700 and file is 0600.
 pub(crate) fn open_log(name: &str) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let p = log_path(name);
     if let Some(parent) = p.parent() {
         config::assert_not_symlink(parent)?;
         std::fs::create_dir_all(parent)?;
-        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        let _ = std::fs::set_permissions(parent, crate::platform::permissions_from_mode(0o700));
     }
     config::assert_not_symlink(&p)?;
     let f = std::fs::OpenOptions::new()
@@ -97,13 +115,14 @@ pub(crate) fn open_log(name: &str) -> std::io::Result<std::fs::File> {
         .mode(0o600)
         .custom_flags(libc_o_nofollow())
         .open(&p)?;
-    let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+    let _ = std::fs::set_permissions(&p, crate::platform::permissions_from_mode(0o600));
     Ok(f)
 }
 
 /// Append a redaction-safe operation event to `operation.log`.
 /// Callers must pass only coarse stage metadata, never keys, secrets, base URLs, or request bodies.
 pub(crate) fn append_operation_log(line: &str) {
+    #[cfg(unix)]
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let p = log_path("operation.log");
     let Some(parent) = p.parent() else {
@@ -115,7 +134,7 @@ pub(crate) fn append_operation_log(line: &str) {
     if std::fs::create_dir_all(parent).is_err() {
         return;
     }
-    let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+    let _ = std::fs::set_permissions(parent, crate::platform::permissions_from_mode(0o700));
     rotate_operation_log_if_needed(&p, line.len() as u64 + 1);
     let mut f = match std::fs::OpenOptions::new()
         .append(true)
@@ -127,7 +146,7 @@ pub(crate) fn append_operation_log(line: &str) {
         Ok(f) => f,
         Err(_) => return,
     };
-    let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+    let _ = std::fs::set_permissions(&p, crate::platform::permissions_from_mode(0o600));
     let _ = writeln!(f, "{line}");
 }
 
@@ -140,6 +159,7 @@ fn should_rotate_operation_log(current_bytes: u64, incoming_bytes: u64) -> bool 
 }
 
 fn rotate_operation_log_if_needed(p: &Path, incoming_bytes: u64) {
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     let Ok(md) = std::fs::metadata(p) else {
@@ -154,7 +174,7 @@ fn rotate_operation_log_if_needed(p: &Path, incoming_bytes: u64) {
     }
     let _ = std::fs::remove_file(&archive);
     if std::fs::rename(p, &archive).is_ok() {
-        let _ = std::fs::set_permissions(&archive, std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::set_permissions(&archive, crate::platform::permissions_from_mode(0o600));
     }
 }
 
@@ -218,6 +238,7 @@ fn select_browser_open_binary(override_bin: Option<std::ffi::OsString>) -> Resul
     }
     #[cfg(unix)]
     {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         if meta.permissions().mode() & 0o111 == 0 {
             return Err("Acceptance 测试 opener 不可执行".into());
@@ -237,6 +258,22 @@ fn browser_open_binary() -> Result<PathBuf, String> {
 }
 
 pub(crate) fn open_in_browser(url: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        // Windows 移植：无 /usr/bin/open；用 cmd start 走默认浏览器。
+        use crate::platform::CreationFlagsExt;
+        let status = Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .status()
+            .map_err(|e| format!("打开浏览器失败：{e}"))?;
+        if !status.success() {
+            return Err(format!("open 非零退出（{:?}）", status.code()));
+        }
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
     // Formal and manually launched Acceptance builds default to the fixed
     // system opener. Only an explicit test-only absolute executable override
     // can divert an Acceptance/test run into a fake evidence recorder.
@@ -249,6 +286,7 @@ pub(crate) fn open_in_browser(url: &str) -> Result<(), String> {
         return Err(format!("open 非零退出（{:?}）", st.code()));
     }
     Ok(())
+    }
 }
 
 #[cfg(test)]

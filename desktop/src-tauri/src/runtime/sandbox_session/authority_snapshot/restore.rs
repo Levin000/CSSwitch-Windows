@@ -23,15 +23,15 @@ impl AuthorityTreeSnapshot {
                 ))
             }
         };
-        if metadata.st_mode & libc::S_IFMT == libc::S_IFLNK {
+        if metadata.st_mode & crate::platform::S_IFMT == crate::platform::S_IFLNK {
             return Err(format!(
                 "code=authority_restore_root_symlink scope={}",
                 scope.code()
             ));
         }
         if matches!(
-            metadata.st_mode & libc::S_IFMT,
-            libc::S_IFDIR | libc::S_IFREG
+            metadata.st_mode & crate::platform::S_IFMT,
+            crate::platform::S_IFDIR | crate::platform::S_IFREG
         ) {
             Self::remove_tree_at(parent, name).map_err(|error| {
                 format!(
@@ -96,7 +96,7 @@ impl AuthorityTreeSnapshot {
         })?;
         if u64::try_from(current.st_dev).ok() != Some(expected_device)
             || inode_u64(current.st_ino) != Some(expected_inode)
-            || current.st_mode & libc::S_IFMT != expected_kind
+            || current.st_mode & crate::platform::S_IFMT != expected_kind
         {
             return Err(format!(
                 "code=authority_restore_backup_identity_changed scope={}",

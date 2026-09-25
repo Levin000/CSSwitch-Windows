@@ -534,10 +534,7 @@ pub fn tcp_reachable(host: &str, port: u16, timeout_ms: u64) -> bool {
 /// 生成一次性 path-secret：从 /dev/urandom 取 16 字节，hex 编码为 32 字符。
 /// 失败关闭：urandom 不可用时返回 Err，绝不退回可猜的弱 secret（宁可起代理失败）。
 pub fn gen_secret() -> std::io::Result<String> {
-    use std::fs::File;
-    let mut b = [0u8; 16];
-    let mut f = File::open("/dev/urandom")?;
-    f.read_exact(&mut b)?;
+    let b = crate::platform::rand_bytes(16)?;
     Ok(hex(&b))
 }
 

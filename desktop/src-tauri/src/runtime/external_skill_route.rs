@@ -72,12 +72,10 @@ pub(crate) fn ensure_route_skill(data_dir: &Path) -> Result<bool, String> {
         .map_err(|e| format!("编码路由 Skill 来源标记失败：{e}"))?;
         marker.push(b'\n');
         write_new_file(&temp.join(IMPORT_ORIGIN_FILE), &marker)?;
-        File::open(&temp)
-            .and_then(|directory| directory.sync_all())
+        crate::platform::sync_directory(&temp)
             .map_err(|e| format!("同步路由 Skill 临时目录失败：{e}"))?;
         rename_no_replace(&temp, &target)?;
-        File::open(skills_root)
-            .and_then(|directory| directory.sync_all())
+        crate::platform::sync_directory(skills_root)
             .map_err(|e| format!("同步 Skills 目录失败：{e}"))?;
         Ok(())
     })();
@@ -265,8 +263,7 @@ fn migrate_legacy_route_body(target: &Path) -> Result<(), String> {
         write_new_file(&temporary, SKILL_BODY.as_bytes())?;
         fs::rename(&temporary, &body_path)
             .map_err(|error| format!("升级 CSSwitch 路由 Skill 失败：{error}"))?;
-        File::open(target)
-            .and_then(|directory| directory.sync_all())
+        crate::platform::sync_directory(target)
             .map_err(|error| format!("同步 CSSwitch 路由 Skill 升级失败：{error}"))
     })();
     if result.is_err() {

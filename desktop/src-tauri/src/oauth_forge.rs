@@ -4,7 +4,9 @@
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 
@@ -102,10 +104,7 @@ const VIRTUAL_ORG_MARKER_FILE: &str = "virtual-org.v1.json";
 
 // ---------- 随机与编码 ----------
 fn rand_bytes(n: usize) -> std::io::Result<Vec<u8>> {
-    let mut f = std::fs::File::open("/dev/urandom")?;
-    let mut b = vec![0u8; n];
-    f.read_exact(&mut b)?;
-    Ok(b)
+    crate::platform::rand_bytes(n)
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -225,13 +224,22 @@ fn assert_not_symlink(path: &Path) -> Result<(), String> {
 }
 
 fn sync_directory(path: &Path) -> Result<(), String> {
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-        .map_err(|e| format!("打开目录做 durable sync 失败：{e}"))?
-        .sync_all()
-        .map_err(|e| format!("durable sync 目录失败：{e}"))
+    #[cfg(unix)]
+    {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|e| format!("打开目录做 durable sync 失败：{e}"))?
+            .sync_all()
+            .map_err(|e| format!("durable sync 目录失败：{e}"))
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows 降级：目录无法以句柄 fsync；跳过目录级持久化屏障（注释降级）。
+        let _ = path;
+        Ok(())
+    }
 }
 
 /// 安全写：拒符号链接 + O_EXCL 临时文件 + file fsync + rename + parent fsync，
@@ -260,15 +268,22 @@ fn safe_write_with_durability_fault(
     let suffix = hex(&rand_bytes(6).map_err(|e| e.to_string())?);
     let tmp = parent.join(format!(".tmp-{suffix}"));
     let result = (|| -> Result<(), String> {
+        #[cfg(unix)]
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true) // O_CREAT|O_EXCL
             .mode(mode)
             .open(&tmp)
             .map_err(|e| format!("建临时文件失败：{e}"))?;
+        #[cfg(not(unix))]
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true) // O_CREAT|O_EXCL
+            .open(&tmp)
+            .map_err(|e| format!("建临时文件失败：{e}"))?;
         f.write_all(data)
             .map_err(|e| format!("写临时文件失败：{e}"))?;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))
+        crate::platform::set_path_mode(&tmp, mode)
             .map_err(|e| format!("chmod 临时文件失败：{e}"))?;
         #[cfg(test)]
         if _fault == SafeWriteDurabilityFault::BeforeFileSync {
@@ -292,12 +307,20 @@ fn safe_write_with_durability_fault(
 }
 
 fn chmod_best_effort(p: &Path, mode: u32) {
-    let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode));
+    let _ = crate::platform::set_path_mode(p, mode);
 }
 
 fn current_uid() -> u32 {
-    // SAFETY: geteuid has no preconditions and does not dereference pointers.
-    unsafe { libc::geteuid() }
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid has no preconditions and does not dereference pointers.
+        unsafe { libc::geteuid() }
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows 降级：无 uid 概念；所有权检查恒按「当前用户」放行（注释降级）。
+        0
+    }
 }
 
 pub(crate) fn marker_path(sandbox_root: &Path) -> Result<PathBuf, String> {
@@ -325,10 +348,14 @@ fn validate_marker_location(path: &Path, sandbox_root: &Path) -> Result<(), Stri
     ] {
         match std::fs::symlink_metadata(candidate) {
             Ok(metadata) => {
+                #[cfg(unix)]
+                let unsafe_owner =
+                    metadata.uid() != current_uid() || metadata.mode() & 0o077 != 0;
+                #[cfg(not(unix))]
+                let unsafe_owner = false; // Windows 降级：无 uid/mode 检查（注释降级）。
                 if metadata.file_type().is_symlink()
                     || !metadata.file_type().is_dir()
-                    || metadata.uid() != current_uid()
-                    || (candidate == state_dir && metadata.mode() & 0o077 != 0)
+                    || unsafe_owner
                 {
                     return Err(format!("{label} 类型或所有者不安全，已拒绝使用历史标记"));
                 }
@@ -341,15 +368,30 @@ fn validate_marker_location(path: &Path, sandbox_root: &Path) -> Result<(), Stri
 }
 
 fn open_marker_parent_nofollow(path: &Path) -> Result<Option<std::fs::File>, String> {
-    let parent = path.parent().ok_or("虚拟组织标记无父目录")?;
-    match std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(parent)
+    #[cfg(unix)]
     {
-        Ok(file) => Ok(Some(file)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("打开 CSSwitch 私有状态目录失败：{error}")),
+        let parent = path.parent().ok_or("虚拟组织标记无父目录")?;
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(parent)
+        {
+            Ok(file) => Ok(Some(file)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!("打开 CSSwitch 私有状态目录失败：{error}")),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows 降级：目录不能作为 File 打开；只探测存在性与类型，真实读取在
+        // read_marker 的 Windows 分支按路径 + lstat 完成。
+        let parent = path.parent().ok_or("虚拟组织标记无父目录")?;
+        match std::fs::symlink_metadata(parent) {
+            Ok(metadata) if metadata.is_dir() => Ok(None),
+            Ok(_) => Err("CSSwitch 私有状态目录类型不安全".into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!("打开 CSSwitch 私有状态目录失败：{error}")),
+        }
     }
 }
 
@@ -371,10 +413,14 @@ fn ensure_marker_parent(path: &Path, sandbox_root: &Path) -> Result<(), String> 
     std::fs::create_dir_all(parent).map_err(|e| format!("创建 CSSwitch 私有状态目录失败：{e}"))?;
     let metadata = std::fs::symlink_metadata(parent)
         .map_err(|e| format!("检查 CSSwitch 私有状态目录失败：{e}"))?;
-    if !metadata.is_dir() || metadata.uid() != current_uid() {
+    if !metadata.is_dir() {
+        return Err("拒绝使用非目录的 CSSwitch 私有状态目录".into());
+    }
+    #[cfg(unix)]
+    if metadata.uid() != current_uid() {
         return Err("拒绝使用非当前用户所有的 CSSwitch 私有状态目录".into());
     }
-    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+    crate::platform::set_path_mode(parent, 0o700)
         .map_err(|e| format!("收紧 CSSwitch 私有状态目录权限失败：{e}"))?;
     sync_directory(parent)?;
     sync_directory(
@@ -389,41 +435,66 @@ fn ensure_marker_parent(path: &Path, sandbox_root: &Path) -> Result<(), String> 
 fn read_marker(resolved: &Path, sandbox_root: &Path) -> Result<MarkerRead, String> {
     let path = marker_path(sandbox_root)?;
     validate_marker_location(&path, sandbox_root)?;
-    let Some(parent) = open_marker_parent_nofollow(&path)? else {
-        return Ok(MarkerRead::Missing);
-    };
-    let name = std::ffi::CString::new(VIRTUAL_ORG_MARKER_FILE).expect("static filename");
-    // SAFETY: parent is an owned directory fd; name is NUL-terminated; flags
-    // request a read-only, non-following descriptor.
-    let fd = unsafe {
-        libc::openat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        let error = std::io::Error::last_os_error();
-        if error.kind() == std::io::ErrorKind::NotFound {
+    #[cfg(unix)]
+    let bytes = {
+        let Some(parent) = open_marker_parent_nofollow(&path)? else {
             return Ok(MarkerRead::Missing);
+        };
+        let name = std::ffi::CString::new(VIRTUAL_ORG_MARKER_FILE).expect("static filename");
+        // SAFETY: parent is an owned directory fd; name is NUL-terminated; flags
+        // request a read-only, non-following descriptor.
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return Ok(MarkerRead::Missing);
+            }
+            return Err(format!("读取 CSSwitch 历史标记失败：{error}"));
         }
-        return Err(format!("读取 CSSwitch 历史标记失败：{error}"));
-    }
-    // SAFETY: fd was returned uniquely by openat and is transferred to File.
-    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-    let metadata = file
-        .metadata()
-        .map_err(|e| format!("检查 CSSwitch 历史标记失败：{e}"))?;
-    if !metadata.is_file()
-        || metadata.uid() != current_uid()
-        || metadata.len() > VIRTUAL_ORG_MARKER_MAX_BYTES
-        || metadata.mode() & 0o077 != 0
-    {
-        return Err("CSSwitch 历史标记类型、所有者、大小或权限不安全，已拒绝使用".into());
-    }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut bytes)
-        .map_err(|e| format!("读取 CSSwitch 历史标记失败：{e}"))?;
+        // SAFETY: fd was returned uniquely by openat and is transferred to File.
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let metadata = file
+            .metadata()
+            .map_err(|e| format!("检查 CSSwitch 历史标记失败：{e}"))?;
+        if !metadata.is_file()
+            || metadata.uid() != current_uid()
+            || metadata.len() > VIRTUAL_ORG_MARKER_MAX_BYTES
+            || metadata.mode() & 0o077 != 0
+        {
+            return Err("CSSwitch 历史标记类型、所有者、大小或权限不安全，已拒绝使用".into());
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.read_to_end(&mut bytes)
+            .map_err(|e| format!("读取 CSSwitch 历史标记失败：{e}"))?;
+        bytes
+    };
+    #[cfg(not(unix))]
+    let bytes = {
+        // Windows 降级：无 openat/no-follow；lstat 拒绝符号链接后按路径读取，
+        // uid/mode 校验不可用（注释降级）。
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(MarkerRead::Missing);
+            }
+            Err(error) => return Err(format!("读取 CSSwitch 历史标记失败：{error}")),
+        };
+        if !metadata.is_file() || metadata.len() > VIRTUAL_ORG_MARKER_MAX_BYTES {
+            return Err("CSSwitch 历史标记类型、所有者、大小或权限不安全，已拒绝使用".into());
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        let mut file = std::fs::File::open(&path)
+            .map_err(|e| format!("读取 CSSwitch 历史标记失败：{e}"))?;
+        file.read_to_end(&mut bytes)
+            .map_err(|e| format!("读取 CSSwitch 历史标记失败：{e}"))?;
+        bytes
+    };
     if bytes.len() as u64 > VIRTUAL_ORG_MARKER_MAX_BYTES {
         return Err("CSSwitch 历史标记超过大小限制，已拒绝使用".into());
     }
@@ -445,9 +516,11 @@ pub(crate) fn bootstrap_marker_for_intact_login(
     email: &str,
     sandbox_root: &Path,
 ) -> Result<(), String> {
+    // Windows 移植：双击启动的进程通常没有 HOME，回退 USERPROFILE。
     let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
-        .ok_or("无 HOME 环境变量")?;
+        .ok_or("无 HOME / USERPROFILE 环境变量")?;
     let resolved = resolve_guarded(auth_dir, email, sandbox_root, &home.join(".claude-science"))?;
     let intact = read_intact_login(&resolved, email).ok_or("隔离虚拟登录不完整，不能补历史标记")?;
     match read_marker(&resolved, sandbox_root)? {
@@ -737,15 +810,23 @@ fn scan_org_dirs(resolved: &Path) -> Vec<HistoryOrgCandidate> {
             let Ok(metadata) = std::fs::symlink_metadata(e.path()) else {
                 continue;
             };
-            if !metadata.file_type().is_dir() || metadata.uid() != current_uid() {
+            #[cfg(unix)]
+            let owned = metadata.uid() == current_uid();
+            #[cfg(not(unix))]
+            let owned = true; // Windows 降级：无 uid 校验（注释降级）。
+            if !metadata.file_type().is_dir() || !owned {
                 continue;
             }
+            #[cfg(unix)]
+            let (device, inode) = (metadata.dev(), metadata.ino());
+            #[cfg(not(unix))]
+            let (device, inode) = (0u64, 0u64); // Windows 降级：无 device/inode 身份。
             if let Some(name) = e.file_name().to_str() {
                 if looks_like_uuid(name) {
                     v.push(HistoryOrgCandidate {
                         org_uuid: name.to_string(),
-                        device: metadata.dev(),
-                        inode: metadata.ino(),
+                        device,
+                        inode,
                     });
                 }
             }
@@ -757,14 +838,25 @@ fn scan_org_dirs(resolved: &Path) -> Vec<HistoryOrgCandidate> {
 
 fn candidate_is_current(resolved: &Path, candidate: &HistoryOrgCandidate) -> bool {
     let path = resolved.join("orgs").join(&candidate.org_uuid);
-    std::fs::symlink_metadata(path)
-        .map(|metadata| {
-            metadata.file_type().is_dir()
-                && metadata.uid() == current_uid()
-                && metadata.dev() == candidate.device
-                && metadata.ino() == candidate.inode
-        })
-        .unwrap_or(false)
+    #[cfg(unix)]
+    {
+        std::fs::symlink_metadata(path)
+            .map(|metadata| {
+                metadata.file_type().is_dir()
+                    && metadata.uid() == current_uid()
+                    && metadata.dev() == candidate.device
+                    && metadata.ino() == candidate.inode
+            })
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows 降级：无 device/inode/uid，只校验「仍是真实的非符号链接目录」。
+        let _ = candidate;
+        std::fs::symlink_metadata(path)
+            .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+            .unwrap_or(false)
+    }
 }
 
 /// 今天的 UTC 日期 `YYYY-MM-DD`（无外部 crate；Howard Hinnant civil-from-days）。
@@ -872,9 +964,11 @@ fn ensure_virtual_login_unfenced(
     email: &str,
     sandbox_root: &Path,
 ) -> Result<(ForgeResult, LoginAction), EnsureVirtualLoginError> {
+    // Windows 移植：双击启动的进程通常没有 HOME，回退 USERPROFILE。
     let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
-        .ok_or("无 HOME 环境变量")?;
+        .ok_or("无 HOME / USERPROFILE 环境变量")?;
     ensure_virtual_login_guarded(auth_dir, email, sandbox_root, &home.join(".claude-science"))
 }
 
@@ -959,9 +1053,11 @@ fn restore_history_choice_unfenced(
     sandbox_root: &Path,
     candidate: &HistoryOrgCandidate,
 ) -> Result<(ForgeResult, LoginAction), String> {
+    // Windows 移植：双击启动的进程通常没有 HOME，回退 USERPROFILE。
     let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
-        .ok_or("无 HOME 环境变量")?;
+        .ok_or("无 HOME / USERPROFILE 环境变量")?;
     let resolved = resolve_guarded(auth_dir, email, sandbox_root, &home.join(".claude-science"))?;
     if !candidate_is_current(&resolved, candidate) {
         return Err("历史记录候选已变化，本次选择已作废；请重新点击一键开始".into());
@@ -976,7 +1072,10 @@ fn restore_history_choice_unfenced(
 /// 失效（旧版遗留 / 凭证损坏 / 已落登录页），重开也只会再落登录页，应改走「停沙箱 → 修复保
 /// org → 重启」。这样 0.2.0 的健康快捷路径不再把「健康但登录失效」当成可用（修 0.2.1 Bug2）。
 pub fn login_intact(auth_dir: &Path, email: &str, sandbox_root: &Path) -> bool {
-    match std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude-science")) {
+    match std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(|h| PathBuf::from(h).join(".claude-science"))
+    {
         Some(real) => login_intact_guarded(auth_dir, email, sandbox_root, &real),
         None => false,
     }

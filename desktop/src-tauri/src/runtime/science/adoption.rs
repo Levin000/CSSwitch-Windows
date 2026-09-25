@@ -115,7 +115,7 @@ impl Drop for ScienceAdoptionLedgerLock {
     fn drop(&mut self) {
         // SAFETY: the descriptor belongs to this guard and remains open here.
         unsafe {
-            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+            crate::platform::flock(self.file.as_raw_fd(), crate::platform::LOCK_UN);
         }
     }
 }
@@ -142,7 +142,7 @@ fn science_adoption_file_identity(metadata: &fs::Metadata) -> ScienceAdoptionFil
 
 fn private_science_adoption_file(metadata: &fs::Metadata) -> bool {
     metadata.file_type().is_file()
-        && metadata.uid() == unsafe { libc::geteuid() }
+        && metadata.uid() == unsafe { crate::platform::geteuid() }
         && metadata.permissions().mode() & 0o077 == 0
         && metadata.nlink() == 1
         && metadata.len() <= MAX_SCIENCE_ADOPTION_LEDGER_BYTES
@@ -174,7 +174,7 @@ fn secure_science_adoption_store_root(root: &Path) -> Result<PathBuf, String> {
     fs::create_dir_all(root)
         .map_err(|error| format!("创建 Science runtime adoption 存储失败：{error}"))?;
     let canonical = root
-        .canonicalize()
+        .canonicalize_norm()
         .map_err(|error| format!("确认 Science runtime adoption 存储失败：{error}"))?;
     let metadata = root
         .symlink_metadata()
@@ -182,11 +182,11 @@ fn secure_science_adoption_store_root(root: &Path) -> Result<PathBuf, String> {
     if canonical != root
         || metadata.file_type().is_symlink()
         || !metadata.file_type().is_dir()
-        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.uid() != unsafe { crate::platform::geteuid() }
     {
         return Err("Science runtime adoption 存储目录身份不安全".into());
     }
-    fs::set_permissions(root, fs::Permissions::from_mode(0o700))
+    fs::set_permissions(root, crate::platform::permissions_from_mode(0o700))
         .map_err(|error| format!("收紧 Science runtime adoption 存储权限失败：{error}"))?;
     Ok(canonical)
 }
@@ -211,10 +211,10 @@ fn existing_secure_science_adoption_store_root(root: &Path) -> Result<Option<Pat
         cursor = path.parent();
     }
     let canonical = root
-        .canonicalize()
+        .canonicalize_norm()
         .map_err(|error| format!("确认 Science runtime adoption 存储失败：{error}"))?;
     if canonical != root
-        || root_metadata.uid() != unsafe { libc::geteuid() }
+        || root_metadata.uid() != unsafe { crate::platform::geteuid() }
         || root_metadata.permissions().mode() & 0o077 != 0
     {
         return Err("Science runtime adoption 存储目录身份或权限不安全".into());
@@ -229,7 +229,7 @@ fn acquire_science_adoption_ledger_lock(root: &Path) -> Result<ScienceAdoptionLe
         .write(true)
         .create(true)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(crate::platform::O_NOFOLLOW | crate::platform::O_CLOEXEC)
         .open(&path)
         .map_err(|error| format!("打开 Science runtime adoption writer lock 失败：{error}"))?;
     let opened = file
@@ -245,7 +245,7 @@ fn acquire_science_adoption_ledger_lock(root: &Path) -> Result<ScienceAdoptionLe
         return Err("Science runtime adoption writer lock 身份或权限不安全".into());
     }
     // SAFETY: flock receives a valid, open descriptor and does not outlive it.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+    if unsafe { crate::platform::flock(file.as_raw_fd(), crate::platform::LOCK_EX) } != 0 {
         return Err("无法取得 Science runtime adoption writer lock".into());
     }
     let after = file
@@ -400,7 +400,7 @@ fn read_science_adoption_ledger_snapshot(
     let expected = science_adoption_file_identity(&visible);
     let mut file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(crate::platform::O_NOFOLLOW | crate::platform::O_CLOEXEC)
         .open(&path)
         .map_err(|error| format!("打开 Science runtime adoption ledger 失败：{error}"))?;
     let opened = file
@@ -466,7 +466,7 @@ fn write_science_adoption_ledger_cas(
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .custom_flags(crate::platform::O_NOFOLLOW | crate::platform::O_CLOEXEC)
             .open(&temp)
             .map_err(|error| format!("创建 Science runtime adoption 临时 ledger 失败：{error}"))?;
         file.write_all(&bytes)
@@ -483,8 +483,7 @@ fn write_science_adoption_ledger_cas(
         }
         fs::rename(&temp, &path)
             .map_err(|error| format!("原子提交 Science runtime adoption ledger 失败：{error}"))?;
-        File::open(root)
-            .and_then(|directory| directory.sync_all())
+        crate::platform::sync_directory(root)
             .map_err(|error| format!("持久化 Science runtime adoption ledger 目录失败：{error}"))?;
         Ok(())
     })();

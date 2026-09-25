@@ -1,5 +1,5 @@
 #[allow(clippy::useless_conversion)]
-pub(super) fn inode_u64(value: libc::ino_t) -> Option<u64> {
+pub(super) fn inode_u64(value: crate::platform::InoT) -> Option<u64> {
     u64::try_from(value).ok()
 }
 
@@ -10,13 +10,15 @@ pub(super) struct AuthorityTreeSnapshot {
     pub(super) existed: bool,
     pub(super) source_parent: Option<std::fs::File>,
     pub(super) source_name: Option<std::ffi::CString>,
-    pub(super) backup_identity: Option<(u64, u64, libc::mode_t)>,
+    pub(super) backup_identity: Option<(u64, u64, crate::platform::ModeT)>,
     pub(super) backup_parent: Option<std::fs::File>,
     pub(super) backup_name: Option<std::ffi::CString>,
 }
 
+#[cfg(unix)]
 pub(super) struct AuthorityDirectoryStream(*mut libc::DIR);
 
+#[cfg(unix)]
 impl Drop for AuthorityDirectoryStream {
     fn drop(&mut self) {
         unsafe {
@@ -24,6 +26,10 @@ impl Drop for AuthorityDirectoryStream {
         }
     }
 }
+
+// Windows 降级：目录流由 fdopendir 驱动，Windows 上无实现；占位结构仅供类型编译。
+#[cfg(not(unix))]
+pub(super) struct AuthorityDirectoryStream(());
 
 pub(super) const MAX_AUTHORITY_SNAPSHOT_ENTRIES: usize = 131_072;
 pub(super) const MAX_AUTHORITY_SNAPSHOT_FILE_BYTES: u64 = 512 * 1024 * 1024;

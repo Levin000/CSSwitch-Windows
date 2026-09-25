@@ -70,7 +70,7 @@ impl ScienceRuntimeIdentity {
     ) -> Result<csswitch_skill_install_core::ScienceHostContext, String> {
         let canonical = self
             .path
-            .canonicalize()
+            .canonicalize_norm()
             .map_err(|_| "Science binary 不可用，无法启用 Skill attach control")?;
         if canonical != self.path {
             return Err("Science binary 不是 canonical path，无法启用 Skill attach control".into());

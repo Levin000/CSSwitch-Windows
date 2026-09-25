@@ -17,5 +17,14 @@ pub mod policy;
 pub(crate) mod provider_contracts;
 pub mod science_control;
 pub mod server;
+/// POSIX build of the external-skill install bridge (openat/flock/uid-based
+/// authority fence). The whole implementation is compiled only on Unix.
+#[cfg(unix)]
+#[path = "skill_install_unix.rs"]
+pub mod skill_install;
+/// Windows placeholder: the MCP/bridge install-uninstall surface is disabled,
+/// while the gateway process itself still starts and proxies normally.
+#[cfg(not(unix))]
+#[path = "skill_install_windows.rs"]
 pub mod skill_install;
 pub mod static_profile;

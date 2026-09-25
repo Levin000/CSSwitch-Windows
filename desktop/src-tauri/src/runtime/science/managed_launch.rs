@@ -8,7 +8,7 @@ fn managed_launch_record_for(
     if !runtime.is_current() {
         return None;
     }
-    let runtime_path = runtime.path.canonicalize().ok()?;
+    let runtime_path = runtime.path.canonicalize_norm().ok()?;
     if runtime_path != runtime.path {
         return None;
     }
@@ -110,7 +110,7 @@ fn managed_launch_file_identity(metadata: &fs::Metadata) -> ManagedLaunchFileIde
 
 fn private_managed_launch_file(metadata: &fs::Metadata) -> bool {
     metadata.file_type().is_file()
-        && metadata.uid() == unsafe { libc::geteuid() }
+        && metadata.uid() == unsafe { crate::platform::geteuid() }
         && metadata.permissions().mode() & 0o077 == 0
         && metadata.len() > 0
         && metadata.len() <= MAX_MANAGED_LAUNCH_BYTES
@@ -174,7 +174,7 @@ fn read_managed_launch_snapshot_at_result(
         .symlink_metadata()
         .map_err(|error| format!("无法读取 Science managed launch 记录目录身份：{error}"))?;
     if !parent_metadata.file_type().is_dir()
-        || parent_metadata.uid() != unsafe { libc::geteuid() }
+        || parent_metadata.uid() != unsafe { crate::platform::geteuid() }
         || parent_metadata.permissions().mode() & 0o022 != 0
     {
         return Err("Science managed launch 记录目录身份不安全".into());
@@ -185,7 +185,7 @@ fn read_managed_launch_snapshot_at_result(
     let expected_file = managed_launch_file_identity(&metadata);
     let mut file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(crate::platform::O_NOFOLLOW | crate::platform::O_CLOEXEC)
         .open(path)
         .map_err(|error| format!("无法安全打开 Science managed launch 记录：{error}"))?;
     let after = file
@@ -328,14 +328,14 @@ fn write_managed_launch_record_unfenced(record: &ScienceManagedLaunchRecord) -> 
         .symlink_metadata()
         .map_err(|_| "Science managed launch 记录目录不可用")?;
     if !parent_metadata.file_type().is_dir()
-        || parent_metadata.uid() != unsafe { libc::geteuid() }
+        || parent_metadata.uid() != unsafe { crate::platform::geteuid() }
         || parent_metadata.permissions().mode() & 0o022 != 0
     {
         return Err("Science managed launch 记录目录不安全".into());
     }
     if let Ok(metadata) = path.symlink_metadata() {
         if !metadata.file_type().is_file()
-            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.uid() != unsafe { crate::platform::geteuid() }
             || metadata.permissions().mode() & 0o077 != 0
         {
             return Err("Science managed launch 记录不是安全私有普通文件".into());
@@ -351,7 +351,7 @@ fn write_managed_launch_record_unfenced(record: &ScienceManagedLaunchRecord) -> 
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .custom_flags(crate::platform::O_NOFOLLOW | crate::platform::O_CLOEXEC)
             .open(&temp)
             .map_err(|_| "无法创建 Science managed launch 临时记录")?;
         file.write_all(&bytes)
@@ -359,8 +359,7 @@ fn write_managed_launch_record_unfenced(record: &ScienceManagedLaunchRecord) -> 
         file.sync_all()
             .map_err(|_| "无法持久化 Science managed launch 临时记录")?;
         fs::rename(&temp, &path).map_err(|_| "无法提交 Science managed launch 记录")?;
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
+        crate::platform::sync_directory(parent)
             .map_err(|_| "无法持久化 Science managed launch 记录目录")?;
         Ok(())
     })();
@@ -634,8 +633,7 @@ fn restore_unmatched_managed_launch_tombstone(tombstone: &Path, path: &Path) -> 
                     fs::remove_file(tombstone)
                         .map_err(|_| "Science managed launch 记录已恢复但 tombstone 无法清理")?;
                     let parent = path.parent().ok_or("Science managed launch 恢复路径无父目录")?;
-                    File::open(parent)
-                        .and_then(|directory| directory.sync_all())
+                    crate::platform::sync_directory(parent)
                         .map_err(|_| "Science managed launch 恢复目录无法持久化")?;
                     Ok(())
                 }
@@ -717,8 +715,7 @@ fn clear_managed_launch_identity_unfenced(
         });
     }
     fs::remove_file(&tombstone).map_err(|_| "无法清理 Science managed launch 记录")?;
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
+    crate::platform::sync_directory(parent)
         .map_err(|_| "无法持久化 Science managed launch 清理")?;
     Ok(())
 }

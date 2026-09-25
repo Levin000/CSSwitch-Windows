@@ -3,7 +3,8 @@ impl AuthorityTreeSnapshot {
         error.raw_os_error().unwrap_or(-1)
     }
 
-    pub(super) fn clone_regular_file_at(
+    #[cfg(unix)]
+pub(super) fn clone_regular_file_at(
         source_fd: i32,
         parent_fd: i32,
         destination_name: &std::ffi::CStr,
@@ -26,17 +27,18 @@ impl AuthorityTreeSnapshot {
         }
     }
 
-    pub(super) fn open_destination_at(
+    #[cfg(unix)]
+pub(super) fn open_destination_at(
         parent_fd: i32,
         destination_name: &std::ffi::CStr,
         flags: i32,
-        mode: libc::mode_t,
+        mode: crate::platform::ModeT,
     ) -> Result<std::fs::File, std::io::Error> {
         let fd = unsafe {
             libc::openat(
                 parent_fd,
                 destination_name.as_ptr(),
-                flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                flags | crate::platform::O_NOFOLLOW | crate::platform::O_CLOEXEC,
                 libc::c_uint::from(mode),
             )
         };
@@ -47,19 +49,21 @@ impl AuthorityTreeSnapshot {
         }
     }
 
-    pub(super) fn open_directory_at(
+    #[cfg(unix)]
+pub(super) fn open_directory_at(
         parent_fd: i32,
         destination_name: &std::ffi::CStr,
     ) -> Result<std::fs::File, std::io::Error> {
         Self::open_destination_at(
             parent_fd,
             destination_name,
-            libc::O_RDONLY | libc::O_DIRECTORY,
+            crate::platform::O_RDONLY | crate::platform::O_DIRECTORY,
             0,
         )
     }
 
-    pub(super) fn open_absolute_directory(path: &Path) -> Result<std::fs::File, std::io::Error> {
+    #[cfg(unix)]
+pub(super) fn open_absolute_directory(path: &Path) -> Result<std::fs::File, std::io::Error> {
         if !path.is_absolute() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -68,13 +72,13 @@ impl AuthorityTreeSnapshot {
         }
         let mut directory = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .custom_flags(crate::platform::O_DIRECTORY | crate::platform::O_NOFOLLOW | crate::platform::O_CLOEXEC)
             .open("/")?;
         for component in path.components() {
             match component {
                 std::path::Component::RootDir => {}
                 std::path::Component::Normal(name) => {
-                    let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+                    let name = std::ffi::CString::new(name.as_encoded_bytes()).map_err(|_| {
                         std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
                             "directory component contains NUL",
@@ -116,12 +120,12 @@ impl AuthorityTreeSnapshot {
             )
         })?;
         if !initial_config_parent_metadata.is_dir()
-            || initial_config_parent_metadata.uid() != unsafe { libc::geteuid() }
+            || initial_config_parent_metadata.uid() != unsafe { crate::platform::geteuid() }
         {
             return Err("code=authority_snapshot_config_parent_identity_failed".into());
         }
         config_parent
-            .set_permissions(std::fs::Permissions::from_mode(0o700))
+            .set_permissions(crate::platform::permissions_from_mode(0o700))
             .map_err(|error| {
                 format!(
                     "code=authority_snapshot_config_parent_chmod_failed os_error={}",
@@ -135,8 +139,8 @@ impl AuthorityTreeSnapshot {
             )
         })?;
         if !config_parent_metadata.is_dir()
-            || config_parent_metadata.uid() != unsafe { libc::geteuid() }
-            || config_parent_metadata.permissions().mode() & 0o777 != 0o700
+            || config_parent_metadata.uid() != unsafe { crate::platform::geteuid() }
+            || !crate::platform::dir_mode_is_0700(&config_parent_metadata)
         {
             return Err("code=authority_snapshot_config_parent_identity_failed".into());
         }
@@ -211,17 +215,17 @@ impl AuthorityTreeSnapshot {
             )
         })?;
         if !initial_snapshot_parent_metadata.is_dir()
-            || initial_snapshot_parent_metadata.uid() != unsafe { libc::geteuid() }
+            || initial_snapshot_parent_metadata.uid() != unsafe { crate::platform::geteuid() }
             || !Self::destination_entry_matches_file(
                 &parent_entry,
                 &initial_snapshot_parent_metadata,
-                libc::S_IFDIR,
+                crate::platform::S_IFDIR,
             )
         {
             return Err("code=authority_snapshot_root_parent_identity_failed".into());
         }
         snapshot_parent
-            .set_permissions(std::fs::Permissions::from_mode(0o700))
+            .set_permissions(crate::platform::permissions_from_mode(0o700))
             .map_err(|error| {
                 format!(
                     "code=authority_snapshot_root_parent_chmod_failed os_error={}",
@@ -235,12 +239,12 @@ impl AuthorityTreeSnapshot {
             )
         })?;
         if !snapshot_parent_metadata.is_dir()
-            || snapshot_parent_metadata.uid() != unsafe { libc::geteuid() }
-            || snapshot_parent_metadata.permissions().mode() & 0o777 != 0o700
+            || snapshot_parent_metadata.uid() != unsafe { crate::platform::geteuid() }
+            || !crate::platform::dir_mode_is_0700(&snapshot_parent_metadata)
             || !Self::destination_entry_matches_file(
                 &parent_entry,
                 &snapshot_parent_metadata,
-                libc::S_IFDIR,
+                crate::platform::S_IFDIR,
             )
         {
             return Err("code=authority_snapshot_root_parent_identity_failed".into());
@@ -294,7 +298,8 @@ impl AuthorityTreeSnapshot {
             && expected.uid() == actual.uid())
     }
 
-    pub(super) fn read_directory_names(
+    #[cfg(unix)]
+pub(super) fn read_directory_names(
         directory: &std::fs::File,
     ) -> Result<Vec<std::ffi::OsString>, std::io::Error> {
         let duplicate = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
@@ -340,21 +345,22 @@ impl AuthorityTreeSnapshot {
         Ok(names)
     }
 
-    pub(super) fn remove_tree_at(
+    #[cfg(unix)]
+pub(super) fn remove_tree_at(
         destination_parent: &std::fs::File,
         destination_name: &std::ffi::CStr,
     ) -> Result<(), std::io::Error> {
         let entry = Self::stat_destination_at(destination_parent, destination_name)?;
-        match entry.st_mode & libc::S_IFMT {
-            libc::S_IFDIR => {
+        match entry.st_mode & crate::platform::S_IFMT {
+            crate::platform::S_IFDIR => {
                 let directory =
                     Self::open_directory_at(destination_parent.as_raw_fd(), destination_name)?;
                 let metadata = directory.metadata()?;
-                if !Self::destination_entry_matches_file(&entry, &metadata, libc::S_IFDIR) {
+                if !Self::destination_entry_matches_file(&entry, &metadata, crate::platform::S_IFDIR) {
                     return Err(std::io::Error::other("directory entry identity changed"));
                 }
                 for child in Self::read_directory_names(&directory)? {
-                    let child = std::ffi::CString::new(child.as_bytes()).map_err(|_| {
+                    let child = std::ffi::CString::new(child.as_encoded_bytes()).map_err(|_| {
                         std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
                             "directory entry contains NUL",
@@ -368,7 +374,7 @@ impl AuthorityTreeSnapshot {
                 if !Self::destination_entry_matches_file(
                     &final_entry,
                     &final_metadata,
-                    libc::S_IFDIR,
+                    crate::platform::S_IFDIR,
                 ) {
                     return Err(std::io::Error::other(
                         "directory entry rebound before removal",
@@ -378,14 +384,14 @@ impl AuthorityTreeSnapshot {
                     libc::unlinkat(
                         destination_parent.as_raw_fd(),
                         destination_name.as_ptr(),
-                        libc::AT_REMOVEDIR,
+                        crate::platform::AT_REMOVEDIR,
                     )
                 };
                 if result != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
             }
-            libc::S_IFREG | libc::S_IFLNK => {
+            crate::platform::S_IFREG | crate::platform::S_IFLNK => {
                 Self::unlink_destination_at(destination_parent.as_raw_fd(), destination_name)?;
             }
             _ => {
@@ -397,10 +403,11 @@ impl AuthorityTreeSnapshot {
         destination_parent.sync_all()
     }
 
-    pub(super) fn mkdir_destination_at(
+    #[cfg(unix)]
+pub(super) fn mkdir_destination_at(
         parent_fd: i32,
         destination_name: &std::ffi::CStr,
-        mode: libc::mode_t,
+        mode: crate::platform::ModeT,
     ) -> Result<(), std::io::Error> {
         let result = unsafe { libc::mkdirat(parent_fd, destination_name.as_ptr(), mode) };
         if result == 0 {
@@ -410,7 +417,8 @@ impl AuthorityTreeSnapshot {
         }
     }
 
-    pub(super) fn unlink_destination_at(
+    #[cfg(unix)]
+pub(super) fn unlink_destination_at(
         parent_fd: i32,
         destination_name: &std::ffi::CStr,
     ) -> Result<(), std::io::Error> {
@@ -426,7 +434,7 @@ impl AuthorityTreeSnapshot {
         let name = path
             .file_name()
             .ok_or("code=authority_snapshot_destination_name_missing")?;
-        std::ffi::CString::new(name.as_bytes())
+        std::ffi::CString::new(name.as_encoded_bytes())
             .map_err(|_| "code=authority_snapshot_destination_name_invalid".into())
     }
 
@@ -455,17 +463,18 @@ impl AuthorityTreeSnapshot {
         })
     }
 
-    pub(super) fn stat_destination_at(
+    #[cfg(unix)]
+pub(super) fn stat_destination_at(
         destination_parent: &std::fs::File,
         destination_name: &std::ffi::CStr,
-    ) -> Result<libc::stat, std::io::Error> {
-        let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    ) -> Result<crate::platform::Stat, std::io::Error> {
+        let mut stat = std::mem::MaybeUninit::<crate::platform::Stat>::zeroed();
         let result = unsafe {
             libc::fstatat(
                 destination_parent.as_raw_fd(),
                 destination_name.as_ptr(),
                 stat.as_mut_ptr(),
-                libc::AT_SYMLINK_NOFOLLOW,
+                crate::platform::AT_SYMLINK_NOFOLLOW,
             )
         };
         if result == 0 {
@@ -476,16 +485,17 @@ impl AuthorityTreeSnapshot {
     }
 
     pub(super) fn destination_entry_matches_file(
-        entry: &libc::stat,
+        entry: &crate::platform::Stat,
         file: &std::fs::Metadata,
-        expected_kind: libc::mode_t,
+        expected_kind: crate::platform::ModeT,
     ) -> bool {
         u64::try_from(entry.st_dev).ok() == Some(file.dev())
             && inode_u64(entry.st_ino) == Some(file.ino())
-            && entry.st_mode & libc::S_IFMT == expected_kind
+            && entry.st_mode & crate::platform::S_IFMT == expected_kind
     }
 
-    pub(super) fn readlink_destination_at(
+    #[cfg(unix)]
+pub(super) fn readlink_destination_at(
         destination_parent: &std::fs::File,
         destination_name: &std::ffi::CStr,
         expected_len: usize,
@@ -551,7 +561,7 @@ impl AuthorityTreeSnapshot {
         AuthoritySnapshotCategory::Other
     }
 
-    pub(super) fn stat_entry_stable(initial: &libc::stat, final_entry: &libc::stat) -> bool {
+    pub(super) fn stat_entry_stable(initial: &crate::platform::Stat, final_entry: &crate::platform::Stat) -> bool {
         initial.st_dev == final_entry.st_dev
             && initial.st_ino == final_entry.st_ino
             && initial.st_mode == final_entry.st_mode
@@ -570,7 +580,7 @@ impl AuthorityTreeSnapshot {
         names
             .iter()
             .map(|name| {
-                let name_c = std::ffi::CString::new(name.as_bytes())
+                let name_c = std::ffi::CString::new(name.as_encoded_bytes())
                     .map_err(|_| "code=authority_snapshot_source_name_invalid")?;
                 let metadata = Self::stat_destination_at(directory, &name_c).map_err(|error| {
                     format!(
@@ -578,10 +588,10 @@ impl AuthorityTreeSnapshot {
                         Self::os_error_code(&error)
                     )
                 })?;
-                let kind = match metadata.st_mode & libc::S_IFMT {
-                    libc::S_IFREG => 1,
-                    libc::S_IFDIR => 2,
-                    libc::S_IFLNK => 3,
+                let kind = match metadata.st_mode & crate::platform::S_IFMT {
+                    crate::platform::S_IFREG => 1,
+                    crate::platform::S_IFDIR => 2,
+                    crate::platform::S_IFLNK => 3,
                     _ => 4,
                 };
                 Ok(AuthorityDirectoryEntryIdentity {
@@ -600,4 +610,88 @@ impl AuthorityTreeSnapshot {
             })
             .collect()
     }
+
+    #[cfg(not(unix))]
+    // Windows 降级：整个权威快照引擎基于 openat/fstatat/fdopendir 相对描述符，
+    // std 无法在 Windows 上复刻；一律返回 Unsupported，由上层调用流程显式报错。
+    pub(super) fn clone_regular_file_at(
+        _source_fd: i32,
+        _parent_fd: i32,
+        _destination_name: &std::ffi::CStr,
+    ) -> Result<(), std::io::Error> {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "authority snapshot requires POSIX openat/fstatat and is unavailable on this platform"))
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn open_destination_at(
+        _parent_fd: i32,
+        _destination_name: &std::ffi::CStr,
+        _flags: crate::platform::ModeT,
+        _mode: crate::platform::ModeT,
+    ) -> Result<std::fs::File, std::io::Error> {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "authority snapshot requires POSIX openat/fstatat and is unavailable on this platform"))
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn open_directory_at(
+        _parent_fd: i32,
+        _destination_name: &std::ffi::CStr,
+    ) -> Result<std::fs::File, std::io::Error> {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "authority snapshot requires POSIX openat/fstatat and is unavailable on this platform"))
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn open_absolute_directory(_path: &Path) -> Result<std::fs::File, std::io::Error> {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "authority snapshot requires POSIX openat/fstatat and is unavailable on this platform"))
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn read_directory_names(
+        _directory: &std::fs::File,
+    ) -> Result<Vec<std::ffi::OsString>, std::io::Error> {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "authority snapshot requires POSIX openat/fstatat and is unavailable on this platform"))
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn remove_tree_at(
+        _destination_parent: &std::fs::File,
+        _destination_name: &std::ffi::CStr,
+    ) -> Result<(), std::io::Error> {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "authority snapshot requires POSIX openat/fstatat and is unavailable on this platform"))
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn mkdir_destination_at(
+        _parent_fd: i32,
+        _destination_name: &std::ffi::CStr,
+        _mode: crate::platform::ModeT,
+    ) -> Result<(), std::io::Error> {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "authority snapshot requires POSIX openat/fstatat and is unavailable on this platform"))
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn unlink_destination_at(
+        _parent_fd: i32,
+        _destination_name: &std::ffi::CStr,
+    ) -> Result<(), std::io::Error> {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "authority snapshot requires POSIX openat/fstatat and is unavailable on this platform"))
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn stat_destination_at(
+        _destination_parent: &std::fs::File,
+        _destination_name: &std::ffi::CStr,
+    ) -> Result<crate::platform::Stat, std::io::Error> {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "authority snapshot requires POSIX openat/fstatat and is unavailable on this platform"))
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn readlink_destination_at(
+        _destination_parent: &std::fs::File,
+        _destination_name: &std::ffi::CStr,
+        _expected_len: usize,
+    ) -> Result<Vec<u8>, std::io::Error> {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "authority snapshot requires POSIX openat/fstatat and is unavailable on this platform"))
+    }
+
 }

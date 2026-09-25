@@ -5,8 +5,19 @@
 //! P2-A Codex disable, Gateway auth storage, and Skill ledgers retain their
 //! own authority and wire formats.
 
+#[cfg(not(unix))]
+use std::os::windows::fs::OpenOptionsExt as _;
+
+#[cfg(not(unix))]
+use crate::platform::UnixCompatExt;
+#[cfg(not(unix))]
+use crate::platform::OpenOptionsModeExt;
+#[cfg(not(unix))]
+use std::os::windows::fs::OpenOptionsExt as _;
+
 use std::fs::OpenOptions;
 use std::io::Read;
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
@@ -185,7 +196,7 @@ pub(crate) struct AssetIdentity {
 pub(crate) fn capture_asset_identity(path: &Path) -> Result<Option<AssetIdentity>, String> {
     let mut file = match OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .custom_flags(crate::platform::O_NOFOLLOW | crate::platform::O_NONBLOCK | crate::platform::O_CLOEXEC)
         .open(path)
     {
         Ok(file) => file,
@@ -196,7 +207,7 @@ pub(crate) fn capture_asset_identity(path: &Path) -> Result<Option<AssetIdentity
         .metadata()
         .map_err(|error| format!("无法检查 SSH leaf identity：{error}"))?;
     // SAFETY: geteuid has no preconditions and does not dereference pointers.
-    let uid = unsafe { libc::geteuid() };
+    let uid = unsafe { crate::platform::geteuid() };
     if !metadata.is_file()
         || metadata.uid() != uid
         || metadata.nlink() != 1
@@ -655,7 +666,7 @@ fn validate_receipt(receipt: &ConfigMutationReceipt) -> Result<(), String> {
 }
 
 fn valid_asset_identity(identity: &AssetIdentity) -> bool {
-    identity.uid == unsafe { libc::geteuid() }
+    identity.uid == unsafe { crate::platform::geteuid() }
         && identity.device > 0
         && identity.inode > 0
         && identity.nlink == 1
@@ -1431,7 +1442,7 @@ mod tests {
         let dir = config_dir();
         config::save_to(&dir, &Config::default()).unwrap();
         let identity = AssetIdentity {
-            uid: unsafe { libc::geteuid() },
+            uid: unsafe { crate::platform::geteuid() },
             device: 1,
             inode: 1,
             mode: 0o600,

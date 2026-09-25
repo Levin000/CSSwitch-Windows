@@ -1,9 +1,15 @@
 //! Recovery projection orchestration: app/config snapshots and one-click authority capture/restore.
 //! Coordinates `authority_snapshot` primitives with `pending_cleanup` registration.
 
+#[cfg(not(unix))]
+use crate::platform::UnixCompatExt;
+
 use std::io::Read;
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -50,7 +56,7 @@ struct DurableAuthorityTreeV2 {
     backup_relative: PathBuf,
     existed: bool,
     source_parent_identity: Option<(u64, u64)>,
-    backup_identity: Option<(u64, u64, libc::mode_t)>,
+    backup_identity: Option<(u64, u64, crate::platform::ModeT)>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -83,7 +89,7 @@ enum DurableAuthorityTargetIdentity {
     Entry {
         device: u64,
         inode: u64,
-        kind: libc::mode_t,
+        kind: crate::platform::ModeT,
     },
 }
 
@@ -136,13 +142,13 @@ pub(super) fn read_registered_private_manifest(
     let name =
         std::ffi::CString::new(name).map_err(|_| "private replay manifest name is invalid")?;
     let mut file =
-        AuthorityTreeSnapshot::open_destination_at(root.as_raw_fd(), &name, libc::O_RDONLY, 0)
+        AuthorityTreeSnapshot::open_destination_at(root.as_raw_fd(), &name, crate::platform::O_RDONLY, 0)
             .map_err(|error| format!("private replay manifest open failed: {error}"))?;
     let metadata = file
         .metadata()
         .map_err(|error| format!("private replay manifest metadata failed: {error}"))?;
     if !metadata.is_file()
-        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.uid() != unsafe { crate::platform::geteuid() }
         || metadata.permissions().mode() & 0o777 != 0o600
         || metadata.nlink() != 1
         || metadata.len() == 0
@@ -340,7 +346,7 @@ impl OneClickAuthoritySnapshot {
         }
         let name = std::ffi::CString::new(DURABLE_AUTHORITY_REPLAY_MANIFEST).unwrap();
         let mut file =
-            AuthorityTreeSnapshot::open_destination_at(root.as_raw_fd(), &name, libc::O_RDONLY, 0)
+            AuthorityTreeSnapshot::open_destination_at(root.as_raw_fd(), &name, crate::platform::O_RDONLY, 0)
                 .map_err(|error| {
                     format!("durable authority replay manifest open failed: {error}")
                 })?;
@@ -348,7 +354,7 @@ impl OneClickAuthoritySnapshot {
             format!("durable authority replay manifest metadata failed: {error}")
         })?;
         if !metadata.is_file()
-            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.uid() != unsafe { crate::platform::geteuid() }
             || metadata.permissions().mode() & 0o777 != 0o600
             || metadata.nlink() != 1
             || metadata.len() == 0
@@ -594,9 +600,22 @@ impl OneClickAuthoritySnapshot {
         Ok(bytes)
     }
 
+    // Windows 降级分支在函数体内提前返回，Unix 主体保持原样；
+    // unreachable_code 仅在 Windows 上命中。
+    #[allow(unreachable_code)]
     pub(super) fn registered_snapshot_ticket(
         &self,
     ) -> Result<config::RuntimeSnapshotTicket, String> {
+        // Windows 降级票据：降级 capture 未注册磁盘快照票据，这里直接以
+        // managed_id 构造已验证票据，维持 one-click journal 所需的
+        // snapshot_ticket 字段一致（managed_id 仍由 AuthorityCleanupContext
+        // 生成并通过格式校验）。
+        #[cfg(not(unix))]
+        {
+            return config::RuntimeSnapshotTicket::verified(
+                self.cleanup_context.managed_id.clone(),
+            );
+        }
         let ticket = self
             .cleanup_ticket
             .as_ref()
@@ -610,9 +629,19 @@ impl OneClickAuthoritySnapshot {
         config::RuntimeSnapshotTicket::verified(ticket.entry.managed_id.clone())
     }
 
+    #[allow(unreachable_code)]
     pub(super) fn persist_private_manifest(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
         if bytes.is_empty() || bytes.len() as u64 > MAX_DURABLE_PRIVATE_MANIFEST_BYTES {
             return Err("private recovery manifest size is invalid".into());
+        }
+        // Windows 降级持久化：私有恢复 manifest 需要 fd 相对打开与
+        // 0600/nlink/dev/inode 身份校验，且降级 capture 没有磁盘快照载体；
+        // 这里降级为 no-op（补偿重放 manifest 同样跳过），durable 跨进程
+        // 重放链路在 Windows 上整体不可用（load 侧因缺少注册清单而 fail-closed）。
+        #[cfg(not(unix))]
+        {
+            let _ = (name, bytes);
+            return Ok(());
         }
         let parent = AuthorityTreeSnapshot::open_absolute_directory(
             &self.cleanup_context.expected_snapshot_parent,
@@ -629,8 +658,8 @@ impl OneClickAuthoritySnapshot {
             .expected_root_identity
             .ok_or("private recovery root identity is missing")?;
         if !metadata.is_dir()
-            || metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.permissions().mode() & 0o777 != 0o700
+            || metadata.uid() != unsafe { crate::platform::geteuid() }
+            || !crate::platform::dir_mode_is_0700(&metadata)
             || (metadata.dev(), metadata.ino()) != expected
         {
             return Err("private recovery root identity changed".into());
@@ -640,19 +669,19 @@ impl OneClickAuthoritySnapshot {
         let mut manifest = AuthorityTreeSnapshot::open_destination_at(
             root.as_raw_fd(),
             &manifest_name,
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+            crate::platform::O_WRONLY | crate::platform::O_CREAT | crate::platform::O_EXCL,
             0o600,
         )
         .map_err(|error| format!("private recovery manifest create failed: {error}"))?;
         std::io::Write::write_all(&mut manifest, bytes)
-            .and_then(|_| manifest.set_permissions(std::fs::Permissions::from_mode(0o600)))
+            .and_then(|_| manifest.set_permissions(crate::platform::permissions_from_mode(0o600)))
             .and_then(|_| manifest.sync_all())
             .map_err(|error| format!("private recovery manifest sync failed: {error}"))?;
         let manifest_metadata = manifest
             .metadata()
             .map_err(|error| format!("private recovery manifest metadata failed: {error}"))?;
         if !manifest_metadata.is_file()
-            || manifest_metadata.uid() != unsafe { libc::geteuid() }
+            || manifest_metadata.uid() != unsafe { crate::platform::geteuid() }
             || manifest_metadata.permissions().mode() & 0o777 != 0o600
             || manifest_metadata.nlink() != 1
             || manifest_metadata.len() != bytes.len() as u64
@@ -664,9 +693,17 @@ impl OneClickAuthoritySnapshot {
             .map_err(|error| format!("private recovery directory sync failed: {error}"))
     }
 
+    #[allow(unreachable_code)]
     pub(super) fn science_opaque_root_bindings(
         root: Option<&std::fs::File>,
     ) -> Result<[Option<(u64, u64)>; SCIENCE_OWNED_OPAQUE_ROOTS.len()], String> {
+        // Windows 降级：opaque 绑定以 dev/inode 锚定（fstatat），Windows 上不可
+        // 观测；一律返回「全部 absent」，即不做任何绑定校验。
+        #[cfg(not(unix))]
+        {
+            let _ = root;
+            return Ok([None; SCIENCE_OWNED_OPAQUE_ROOTS.len()]);
+        }
         let mut bindings = [None; SCIENCE_OWNED_OPAQUE_ROOTS.len()];
         let Some(root) = root else {
             return Ok(bindings);
@@ -676,8 +713,8 @@ impl OneClickAuthoritySnapshot {
                 .map_err(|_| "code=science_environment_root_name_invalid")?;
             match AuthorityTreeSnapshot::stat_destination_at(root, &name) {
                 Ok(identity)
-                    if identity.st_mode & libc::S_IFMT == libc::S_IFDIR
-                        && identity.st_uid == unsafe { libc::geteuid() }
+                    if identity.st_mode & crate::platform::S_IFMT == crate::platform::S_IFDIR
+                        && identity.st_uid == unsafe { crate::platform::geteuid() }
                         && identity.st_mode & 0o022 == 0 =>
                 {
                     let device = u64::try_from(identity.st_dev)
@@ -704,9 +741,17 @@ impl OneClickAuthoritySnapshot {
         Ok(bindings)
     }
 
+    #[allow(unreachable_code)]
     pub(super) fn pin_science_root_and_validate_opaque_entries(
         auth_dir: &Path,
     ) -> Result<Option<std::fs::File>, String> {
+        // Windows 降级：science root pin 依赖 fd 锚定的目录身份与 mode/uid 校验；
+        // 返回 None 表示「未锚定」，后续绑定校验随之降级为空绑定。
+        #[cfg(not(unix))]
+        {
+            let _ = auth_dir;
+            return Ok(None);
+        }
         let root = match AuthorityTreeSnapshot::open_absolute_directory(auth_dir) {
             Ok(root) => root,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -725,7 +770,7 @@ impl OneClickAuthoritySnapshot {
         })?;
         if !metadata.is_dir()
             || metadata.file_type().is_symlink()
-            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.uid() != unsafe { crate::platform::geteuid() }
             || metadata.permissions().mode() & 0o022 != 0
         {
             return Err("code=science_authority_root_identity_failed".into());
@@ -734,10 +779,17 @@ impl OneClickAuthoritySnapshot {
         Ok(Some(root))
     }
 
+    #[allow(unreachable_code)]
     pub(super) fn revalidate_science_root_binding(
         auth_dir: &Path,
         pinned: &Option<std::fs::File>,
     ) -> Result<(), String> {
+        // Windows 降级：没有可复核的 fd/目录绑定，直接视为未漂移。
+        #[cfg(not(unix))]
+        {
+            let _ = (auth_dir, pinned);
+            return Ok(());
+        }
         let Some(pinned) = pinned.as_ref() else {
             return match AuthorityTreeSnapshot::open_absolute_directory(auth_dir) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -762,7 +814,14 @@ impl OneClickAuthoritySnapshot {
         }
     }
 
+    #[allow(unreachable_code)]
     pub(super) fn validate_science_restore_root(&self) -> Result<(), String> {
+        // Windows 降级：恢复前校验依赖 fd 锚定的 science root 与 opaque 绑定；
+        // 降级语义为「允许恢复且不校验身份漂移」（trees 为空，实际 effect 为空）。
+        #[cfg(not(unix))]
+        {
+            return Ok(());
+        }
         let current = Self::pin_science_root_and_validate_opaque_entries(&self.science_root_path)?;
         if Self::science_opaque_root_bindings(current.as_ref())? != self.science_opaque_bindings {
             return Err("code=science_environment_root_rebound category=science_runtime".into());
@@ -802,6 +861,7 @@ impl OneClickAuthoritySnapshot {
             .join(";")
     }
 
+    #[allow(unreachable_code)]
     pub(super) fn capture(
         config_dir: &Path,
         sandbox_home: &Path,
@@ -858,6 +918,34 @@ impl OneClickAuthoritySnapshot {
                 return Err("test-only one-click authority snapshot capture failure".into());
             }
         }
+        // Windows 降级 capture：权威快照引擎基于 POSIX fd 相对操作
+        // （openat/fstatat/fdopendir/renameat）与 dev/inode 身份锚定，Windows 上
+        // 无忠实等价物（文件系统助手一律返回 Unsupported）。降级策略：只保留
+        // 纯路径/纯内存部分——cleanup_context（纯路径构造）、config 克隆与
+        // app 内存快照；跳过 trees 磁盘备份、cleanup 注册票据、science root
+        // pin 与 opaque 绑定、以及 durable manifest 持久化。
+        // 语义损失：事务中途失败时没有磁盘快照可自动回滚（restore 时 trees
+        // 为空，仅回滚 config/app 状态；durable 补偿重放不可用），残留清理由
+        // 「停止全部」手动兜底；success finalize 走降级 cleanup（无快照可清，
+        // 直接 Cleared）。
+        #[cfg(not(unix))]
+        {
+            let cleanup_context = AuthorityCleanupContext::new(config_dir, sandbox_home, state)?;
+            let backup_root = cleanup_context.root.clone();
+            return Ok(Self {
+                backup_root,
+                cleanup_context,
+                cleanup_ticket: None,
+                trees: Vec::new(),
+                science_root_path: auth_dir.to_path_buf(),
+                science_root: None,
+                science_opaque_bindings: [None; SCIENCE_OWNED_OPAQUE_ROOTS.len()],
+                config: config.clone(),
+                app: AppAuthoritySnapshot::capture(state),
+                preserve_recovery: false,
+                cleanup_prepared: false,
+            });
+        }
         let sandbox_dir = sandbox_home
             .parent()
             .ok_or("沙箱 HOME 无父目录，无法建立事务快照")?;
@@ -902,7 +990,7 @@ impl OneClickAuthoritySnapshot {
                     AuthorityTreeSnapshot::os_error_code(&error)
                 )
             })?;
-            root.set_permissions(std::fs::Permissions::from_mode(0o700))
+            root.set_permissions(crate::platform::permissions_from_mode(0o700))
                 .map_err(|error| {
                     format!(
                         "code=authority_snapshot_root_chmod_failed os_error={}",
@@ -917,12 +1005,12 @@ impl OneClickAuthoritySnapshot {
             })?;
             if !metadata.is_dir()
                 || metadata.file_type().is_symlink()
-                || metadata.uid() != unsafe { libc::geteuid() }
-                || metadata.permissions().mode() & 0o777 != 0o700
+                || metadata.uid() != unsafe { crate::platform::geteuid() }
+                || !crate::platform::dir_mode_is_0700(&metadata)
                 || !AuthorityTreeSnapshot::destination_entry_matches_file(
                     &created_root_entry,
                     &metadata,
-                    libc::S_IFDIR,
+                    crate::platform::S_IFDIR,
                 )
             {
                 return Err("code=authority_snapshot_root_identity_failed".into());
@@ -1148,7 +1236,7 @@ impl OneClickAuthoritySnapshot {
         if !AuthorityTreeSnapshot::destination_entry_matches_file(
             &final_root_entry,
             &final_root_metadata,
-            libc::S_IFDIR,
+            crate::platform::S_IFDIR,
         ) {
             return Err(finalize_failed_authority_snapshot(
                 &cleanup_context,
@@ -2148,8 +2236,8 @@ fn durable_authority_entry_identity(
 ) -> Result<DurableAuthorityTargetIdentity, String> {
     match AuthorityTreeSnapshot::stat_destination_at(parent, name) {
         Ok(metadata) => {
-            let kind = metadata.st_mode & libc::S_IFMT;
-            if !matches!(kind, libc::S_IFDIR | libc::S_IFREG) {
+            let kind = metadata.st_mode & crate::platform::S_IFMT;
+            if !matches!(kind, crate::platform::S_IFDIR | crate::platform::S_IFREG) {
                 return Err(
                     "durable authority target identity is unknown; preserved ActiveRecovery".into(),
                 );
@@ -2225,11 +2313,11 @@ fn durable_authority_digest_entry(
     let before = AuthorityTreeSnapshot::stat_destination_at(parent, name).map_err(|_| {
         "durable authority target content identity is unknown; preserved ActiveRecovery"
     })?;
-    let kind = before.st_mode & libc::S_IFMT;
+    let kind = before.st_mode & crate::platform::S_IFMT;
     durable_authority_digest_bytes(digest, b"entry-name", name.to_bytes());
     durable_authority_digest_u64(digest, b"mode", u64::from(before.st_mode & 0o777));
     match kind {
-        libc::S_IFREG => {
+        crate::platform::S_IFREG => {
             let bytes = u64::try_from(before.st_size).map_err(|_| {
                 "durable authority target content identity is unknown; preserved ActiveRecovery"
             })?;
@@ -2244,7 +2332,7 @@ fn durable_authority_digest_entry(
             let mut file = AuthorityTreeSnapshot::open_destination_at(
                 parent.as_raw_fd(),
                 name,
-                libc::O_RDONLY,
+                crate::platform::O_RDONLY,
                 0,
             )
             .map_err(|_| {
@@ -2256,7 +2344,7 @@ fn durable_authority_digest_entry(
             if !AuthorityTreeSnapshot::destination_entry_matches_file(
                 &before,
                 &opened,
-                libc::S_IFREG,
+                crate::platform::S_IFREG,
             ) {
                 return Err(
                     "durable authority target content identity changed; preserved ActiveRecovery"
@@ -2274,7 +2362,7 @@ fn durable_authority_digest_entry(
                 );
             }
         }
-        libc::S_IFDIR => {
+        crate::platform::S_IFDIR => {
             AuthorityTreeSnapshot::charge_entry(
                 budget,
                 0,
@@ -2292,7 +2380,7 @@ fn durable_authority_digest_entry(
             if !AuthorityTreeSnapshot::destination_entry_matches_file(
                 &before,
                 &metadata,
-                libc::S_IFDIR,
+                crate::platform::S_IFDIR,
             ) {
                 return Err(
                     "durable authority target content identity changed; preserved ActiveRecovery"
@@ -2305,14 +2393,14 @@ fn durable_authority_digest_entry(
                 })?;
             durable_authority_digest_u64(digest, b"directory-child-count", children.len() as u64);
             for child in children {
-                let child = std::ffi::CString::new(child.as_bytes()).map_err(|_| {
+                let child = std::ffi::CString::new(child.as_encoded_bytes()).map_err(|_| {
                     "durable authority target content identity is unknown; preserved ActiveRecovery"
                 })?;
                 durable_authority_digest_entry(&directory, &child, budget, digest)?;
             }
             durable_authority_digest_bytes(digest, b"directory-end", b"");
         }
-        libc::S_IFLNK => {
+        crate::platform::S_IFLNK => {
             AuthorityTreeSnapshot::charge_entry(
                 budget,
                 0,
@@ -2367,6 +2455,7 @@ fn durable_authority_rename(
     from: &std::ffi::CStr,
     to: &std::ffi::CStr,
 ) -> Result<(), String> {
+    #[cfg(unix)]
     let result = unsafe {
         libc::renameat(
             parent.as_raw_fd(),
@@ -2375,6 +2464,9 @@ fn durable_authority_rename(
             to.as_ptr(),
         )
     };
+    // Windows 降级：renameat 无等价物；返回失败由上层显式报错。
+    #[cfg(not(unix))]
+    let result: i32 = -1;
     if result == 0 {
         parent.sync_all().map_err(|_| {
             "durable authority rename sync failed; preserved ActiveRecovery".to_string()
@@ -2548,6 +2640,7 @@ impl Drop for OneClickAuthoritySnapshot {
 #[cfg(test)]
 mod durable_authority_digest_tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
@@ -2567,7 +2660,7 @@ mod durable_authority_digest_tests {
         let root = requested_root.canonicalize().unwrap();
         let source = root.join("authority");
         std::fs::create_dir(&source).unwrap();
-        let mode = libc::mode_t::try_from(0o600).unwrap().to_le_bytes();
+        let mode = crate::platform::ModeT::try_from(0o600).unwrap().to_le_bytes();
         // The old raw stream had no child count/end framing. One child whose
         // bytes embed a second child record collides with two child records.
         let mut embedded = b"Xb".to_vec();
@@ -2587,7 +2680,7 @@ mod durable_authority_digest_tests {
             "fixture must collide under the old raw concatenation"
         );
         std::fs::write(source.join("a"), &embedded).unwrap();
-        std::fs::set_permissions(source.join("a"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(source.join("a"), crate::platform::permissions_from_mode(0o600)).unwrap();
         let snapshot = AuthorityTreeSnapshot {
             scope: AuthoritySnapshotScope::Test,
             source: source.clone(),
@@ -2605,7 +2698,7 @@ mod durable_authority_digest_tests {
         std::fs::write(source.join("a"), b"X").unwrap();
         std::fs::write(source.join("b"), b"Y").unwrap();
         for name in ["a", "b"] {
-            std::fs::set_permissions(source.join(name), std::fs::Permissions::from_mode(0o600))
+            std::fs::set_permissions(source.join(name), crate::platform::permissions_from_mode(0o600))
                 .unwrap();
         }
         assert_eq!(

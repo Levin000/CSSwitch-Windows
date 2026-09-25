@@ -8,12 +8,24 @@
 // identity, and recovery disposition inside this module boundary.
 #![allow(clippy::result_large_err)]
 
+#[cfg(not(unix))]
+use crate::platform::{OpenOptionsModeExt, UnixCompatExt};
+#[cfg(not(unix))]
+use std::os::windows::fs::OpenOptionsExt as _;
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
+#[cfg(unix)]
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+#[cfg(unix)]
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
@@ -121,6 +133,7 @@ mod format_runtime_state;
 #[path = "science/selection.rs"]
 mod format_selection;
 
+use crate::platform::CanonicalizeExt;
 include!("science/contracts.rs");
 include!("science/control_runner.rs");
 include!("science/executable.rs");

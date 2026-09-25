@@ -5,6 +5,10 @@
 //! ownership, and test identities stay unchanged while each responsibility has
 //! one file owner.
 
+#[cfg(not(unix))]
+use crate::platform::{OpenOptionsModeExt, UnixCompatExt};
+#[cfg(not(unix))]
+use std::os::windows::fs::OpenOptionsExt as _;
 use std::fs::{self, File, OpenOptions};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write;

@@ -118,7 +118,7 @@ impl AuthorityTreeSnapshot {
             .ok_or("code=authority_snapshot_source_parent_missing")?;
         let backup_identity = match Self::stat_destination_at(source_parent, source_name) {
             Ok(source_identity) => {
-                if source_identity.st_mode & libc::S_IFMT == libc::S_IFLNK {
+                if source_identity.st_mode & crate::platform::S_IFMT == crate::platform::S_IFLNK {
                     return Err(format!(
                         "code=authority_snapshot_root_symlink scope={} category=other",
                         scope.code()
@@ -176,7 +176,7 @@ impl AuthorityTreeSnapshot {
                         .map_err(|_| "code=authority_snapshot_root_device_invalid")?,
                     inode_u64(identity.st_ino)
                         .ok_or("code=authority_snapshot_root_inode_invalid")?,
-                    identity.st_mode & libc::S_IFMT,
+                    identity.st_mode & crate::platform::S_IFMT,
                 ))
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -385,8 +385,8 @@ impl AuthorityTreeSnapshot {
                 Self::os_error_code(&error)
             )
         })?;
-        let source_kind = metadata.st_mode & libc::S_IFMT;
-        if source_kind == libc::S_IFLNK {
+        let source_kind = metadata.st_mode & crate::platform::S_IFMT;
+        if source_kind == crate::platform::S_IFLNK {
             if !allow_symlink {
                 return Err(format!(
                     "code=authority_snapshot_root_symlink scope={} category={}",
@@ -415,6 +415,7 @@ impl AuthorityTreeSnapshot {
             Self::charge_entry(budget, target_bytes.len() as u64, scope, category)?;
             let target_name = std::ffi::CString::new(target_bytes.clone())
                 .map_err(|_| "code=authority_snapshot_symlink_target_invalid")?;
+            #[cfg(unix)]
             let symlink_result = unsafe {
                 libc::symlinkat(
                     target_name.as_ptr(),
@@ -422,6 +423,9 @@ impl AuthorityTreeSnapshot {
                     destination_name.as_ptr(),
                 )
             };
+            // Windows 降级：symlinkat 无等价物；该分支只会经上游 Unsupported 错误到达。
+            #[cfg(not(unix))]
+            let symlink_result: i32 = -1;
             if symlink_result != 0 {
                 let error = std::io::Error::last_os_error();
                 return Err(format!(
@@ -443,7 +447,7 @@ impl AuthorityTreeSnapshot {
                     });
             let snapshot_result = (|| -> Result<(), String> {
                 let destination_identity = destination_identity?;
-                if destination_identity.st_mode & libc::S_IFMT != libc::S_IFLNK {
+                if destination_identity.st_mode & crate::platform::S_IFMT != crate::platform::S_IFLNK {
                     return Err(format!(
                         "code=authority_snapshot_symlink_identity_failed scope={} category={}",
                         scope.code(),
@@ -475,7 +479,7 @@ impl AuthorityTreeSnapshot {
                     )
                 })?;
                 if !Self::stat_entry_stable(&metadata, &final_metadata)
-                    || final_metadata.st_mode & libc::S_IFMT != libc::S_IFLNK
+                    || final_metadata.st_mode & crate::platform::S_IFMT != crate::platform::S_IFLNK
                     || final_target != target_bytes
                 {
                     return Err(format!(
@@ -509,7 +513,7 @@ impl AuthorityTreeSnapshot {
                 })?;
                 if final_destination.st_dev != destination_identity.st_dev
                     || final_destination.st_ino != destination_identity.st_ino
-                    || final_destination.st_mode & libc::S_IFMT != libc::S_IFLNK
+                    || final_destination.st_mode & crate::platform::S_IFMT != crate::platform::S_IFLNK
                     || final_destination_target != target_bytes
                 {
                     return Err(format!(
@@ -540,7 +544,7 @@ impl AuthorityTreeSnapshot {
             }
             return Ok(());
         }
-        if source_kind == libc::S_IFREG {
+        if source_kind == crate::platform::S_IFREG {
             let source_size = u64::try_from(metadata.st_size).map_err(|_| {
                 format!(
                     "code=authority_snapshot_source_size_invalid scope={} category={}",
@@ -553,7 +557,7 @@ impl AuthorityTreeSnapshot {
             let mut input = Self::open_destination_at(
                 source_parent.as_raw_fd(),
                 source_name,
-                libc::O_RDONLY,
+                crate::platform::O_RDONLY,
                 0,
             )
             .map_err(|error| {
@@ -575,7 +579,7 @@ impl AuthorityTreeSnapshot {
                     )
                 })?;
             if !opened.is_file()
-                || !Self::destination_entry_matches_file(&metadata, &opened, libc::S_IFREG)
+                || !Self::destination_entry_matches_file(&metadata, &opened, crate::platform::S_IFREG)
                 || opened.len() != source_size
             {
                 return Err(format!(
@@ -594,7 +598,7 @@ impl AuthorityTreeSnapshot {
                     Ok(()) => Self::open_destination_at(
                         parent_fd,
                         destination_name,
-                        libc::O_RDONLY,
+                        crate::platform::O_RDONLY,
                         0,
                     )
                     .map_err(|error| {
@@ -615,7 +619,7 @@ impl AuthorityTreeSnapshot {
                         let mut output = Self::open_destination_at(
                             parent_fd,
                             destination_name,
-                            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                            crate::platform::O_WRONLY | crate::platform::O_CREAT | crate::platform::O_EXCL,
                             0o600,
                         )
                         .map_err(|error| {
@@ -667,7 +671,7 @@ impl AuthorityTreeSnapshot {
                     }
                 };
                 output
-                    .set_permissions(std::fs::Permissions::from_mode(source_mode))
+                    .set_permissions(crate::platform::permissions_from_mode(source_mode))
                     .map_err(|error| {
                         format!(
                             "code=authority_snapshot_chmod_failed scope={} category={} os_error={}",
@@ -706,7 +710,7 @@ impl AuthorityTreeSnapshot {
                                 Self::os_error_code(&error)
                             )
                         })?;
-                if !Self::destination_entry_matches_file(&destination_entry, &saved, libc::S_IFREG)
+                if !Self::destination_entry_matches_file(&destination_entry, &saved, crate::platform::S_IFREG)
                 {
                     return Err(format!(
                         "code=authority_snapshot_destination_rebound scope={} category={} kind=file",
@@ -737,7 +741,7 @@ impl AuthorityTreeSnapshot {
                     || !Self::destination_entry_matches_file(
                         &final_entry,
                         &final_metadata,
-                        libc::S_IFREG,
+                        crate::platform::S_IFREG,
                     )
                     || final_metadata.dev() != opened.dev()
                     || final_metadata.ino() != opened.ino()
@@ -787,7 +791,7 @@ impl AuthorityTreeSnapshot {
             }
             return Ok(());
         }
-        if source_kind != libc::S_IFDIR {
+        if source_kind != crate::platform::S_IFDIR {
             return Err(format!(
                 "code=authority_snapshot_special_file scope={} category={}",
                 scope.code(),
@@ -817,7 +821,7 @@ impl AuthorityTreeSnapshot {
             || !Self::destination_entry_matches_file(
                 &metadata,
                 &source_directory_metadata,
-                libc::S_IFDIR,
+                crate::platform::S_IFDIR,
             )
         {
             return Err(format!(
@@ -859,7 +863,7 @@ impl AuthorityTreeSnapshot {
                 },
             )?;
         destination_directory
-            .set_permissions(std::fs::Permissions::from_mode(0o700))
+            .set_permissions(crate::platform::permissions_from_mode(0o700))
             .map_err(|error| {
                 format!(
                     "code=authority_snapshot_directory_chmod_failed scope={} category={} os_error={}",
@@ -878,13 +882,13 @@ impl AuthorityTreeSnapshot {
         })?;
         if !destination_metadata.is_dir()
             || destination_metadata.file_type().is_symlink()
-            || destination_metadata.uid() != unsafe { libc::geteuid() }
+            || destination_metadata.uid() != unsafe { crate::platform::geteuid() }
             || (destination_metadata.dev() == source_directory_metadata.dev()
                 && destination_metadata.ino() == source_directory_metadata.ino())
             || !Self::destination_entry_matches_file(
                 &created_destination_entry,
                 &destination_metadata,
-                libc::S_IFDIR,
+                crate::platform::S_IFDIR,
             )
         {
             return Err(format!(
@@ -928,7 +932,7 @@ impl AuthorityTreeSnapshot {
             }
         }
         for child in &children {
-            let child_name = std::ffi::CString::new(child.as_bytes()).map_err(|_| {
+            let child_name = std::ffi::CString::new(child.as_encoded_bytes()).map_err(|_| {
                 format!(
                     "code=authority_snapshot_source_name_invalid scope={} category={}",
                     scope.code(),
@@ -978,7 +982,7 @@ impl AuthorityTreeSnapshot {
         let membership_stable = initial_manifest == final_manifest && children == final_children;
         let entry_stable = Self::stat_entry_stable(&metadata, &final_entry);
         let binding_stable =
-            Self::destination_entry_matches_file(&final_entry, &final_metadata, libc::S_IFDIR);
+            Self::destination_entry_matches_file(&final_entry, &final_metadata, crate::platform::S_IFDIR);
         let opened_stable = final_metadata.dev() == source_directory_metadata.dev()
             && final_metadata.ino() == source_directory_metadata.ino()
             && final_metadata.uid() == source_directory_metadata.uid()
@@ -1027,7 +1031,7 @@ impl AuthorityTreeSnapshot {
             ));
         }
         destination_directory
-            .set_permissions(std::fs::Permissions::from_mode(
+            .set_permissions(crate::platform::permissions_from_mode(
                 source_mode,
             ))
             .map_err(|error| {
@@ -1060,7 +1064,7 @@ impl AuthorityTreeSnapshot {
         if !Self::destination_entry_matches_file(
             &final_destination_entry,
             &final_destination_metadata,
-            libc::S_IFDIR,
+            crate::platform::S_IFDIR,
         ) {
             return Err(format!(
                 "code=authority_snapshot_destination_rebound scope={} category={} kind=directory",

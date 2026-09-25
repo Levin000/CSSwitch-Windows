@@ -117,7 +117,7 @@ fn loopback_port_accepts_tcp(port: u16) -> bool {
                         .write(true)
                         .create_new(true)
                         .mode(0o600)
-                        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                        .custom_flags(crate::platform::O_NOFOLLOW | crate::platform::O_CLOEXEC)
                         .open(&temp)?;
                     file.write_all(&bytes)?;
                     file.sync_all()?;
@@ -155,6 +155,13 @@ fn parse_unique_listener_pid(stdout: &str) -> Option<u32> {
     Some(pid)
 }
 
+#[cfg(windows)]
+fn unique_listener_pid(port: u16) -> Option<u32> {
+    // Windows 移植：无 lsof；解析 netstat -ano 找唯一 LISTEN 进程。
+    crate::platform::listener_pid_for_port(port)
+}
+
+#[cfg(unix)]
 fn unique_listener_pid(port: u16) -> Option<u32> {
     let listener = Command::new("/usr/sbin/lsof")
         .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-t"])
@@ -183,6 +190,15 @@ pub(crate) fn process_start_identity(pid: u32) -> Option<String> {
     {
         return Some("Mon Jan  1 00:00:00 2001".into());
     }
+    #[cfg(windows)]
+    {
+        // Windows 移植：无 /bin/date；用启动时间戳自洽格式（仅与自身记录
+        // 做相等比较，格式无需与 macOS ps lstart 一致）。
+        let (start_seconds, start_micros) = process_start_timestamp(pid)?;
+        return Some(format!("win-start {start_seconds}.{start_micros:06}"));
+    }
+    #[cfg(unix)]
+    {
     let (start_seconds, _) = process_start_timestamp(pid)?;
     let seconds = libc::time_t::try_from(start_seconds).ok()?;
     let output = Command::new("/bin/date")
@@ -205,6 +221,7 @@ pub(crate) fn process_start_identity(pid: u32) -> Option<String> {
     // Preserve the trimmed `ps -o lstart=` representation already stored in
     // schema-v1 managed receipts, without spawning the sandbox-blocked `ps`.
     Some(identity.to_string())
+    }
 }
 
 pub(crate) fn process_start_identity_digest(pid: u32) -> Option<String> {
@@ -217,6 +234,7 @@ pub(crate) fn process_start_identity_digest(pid: u32) -> Option<String> {
     Some(format!("{:x}", digest.finalize()))
 }
 
+#[cfg(target_os = "macos")]
 fn process_start_timestamp(pid: u32) -> Option<(u64, u64)> {
     if pid <= 1 {
         return None;
@@ -244,11 +262,72 @@ fn process_start_timestamp(pid: u32) -> Option<(u64, u64)> {
     Some((start_seconds, start_microseconds))
 }
 
+#[cfg(windows)]
+// Windows 移植：GetProcessTimes 读进程创建时间（FILETIME 100ns → unix 秒/微秒）。
+fn process_start_timestamp(pid: u32) -> Option<(u64, u64)> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    if pid <= 1 {
+        return None;
+    }
+    unsafe {
+        // SAFETY: handle 仅为本次查询而打开，查询后立即关闭。
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return None;
+        }
+        let mut creation = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut exit_time = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut kernel = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut user = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let ok = GetProcessTimes(
+            handle,
+            &mut creation,
+            &mut exit_time,
+            &mut kernel,
+            &mut user,
+        );
+        CloseHandle(handle);
+        if ok == 0 {
+            return None;
+        }
+        let ticks = (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
+        // FILETIME：自 1601-01-01 起 100ns；换算 unix epoch。
+        const EPOCH_DELTA_100NS: u64 = 116_444_736_000_000_000;
+        if ticks < EPOCH_DELTA_100NS {
+            return None;
+        }
+        let unix_100ns = ticks - EPOCH_DELTA_100NS;
+        Some((unix_100ns / 10_000_000, (unix_100ns % 10_000_000) / 10))
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+// Linux 降级：proc_pidinfo 是 macOS 专属 API；无法观测进程启动时间，
+// 返回 None 由上层走无启动时间戳的降级指纹。
+fn process_start_timestamp(_pid: u32) -> Option<(u64, u64)> {
+    None
+}
+
 fn data_dir_identity() -> Option<(PathBuf, u64, u64)> {
-    let data_dir = sandbox_data_dir().canonicalize().ok()?;
+    let data_dir = sandbox_data_dir().canonicalize_norm().ok()?;
     let metadata = data_dir.symlink_metadata().ok()?;
     if !metadata.file_type().is_dir()
-        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.uid() != unsafe { crate::platform::geteuid() }
         || metadata.permissions().mode() & 0o022 != 0
     {
         return None;

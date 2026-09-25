@@ -283,10 +283,27 @@ pub(in super::super) fn replay_interrupted_one_click_compensation<R: Runtime>(
             "legacy durable compensation journal has no replayable step plan; preserved for manual recovery"
                 .into(),
         ),
-        CompensationReplayDecision::RejectIncomplete => Err(
-            "incomplete durable compensation requires an explicit retry decision; preserved for manual recovery"
-                .into(),
-        ),
+        CompensationReplayDecision::RejectIncomplete => {
+            #[cfg(not(unix))]
+            {
+                // Windows 移植降级：Incomplete 日志待重放的步骤（authority
+                // restore / ssh cleanup / science cleanup）在本平台均为 no-op
+                // 降级实现，重放无实际效果；直接清账，避免每次一键被旧失败
+                // 日志永久卡死（macOS 保留原语义：人工恢复）。
+                config::update(&dir, |current| {
+                    current.runtime_compensation = None;
+                })
+                .map_err(|error| {
+                    format!("clearing incomplete compensation journal failed: {error}")
+                })?;
+                Ok(false)
+            }
+            #[cfg(unix)]
+            Err(
+                "incomplete durable compensation requires an explicit retry decision; preserved for manual recovery"
+                    .into(),
+            )
+        }
         CompensationReplayDecision::Finish => {
             let mut progress = replay_progress(&cfg, journal, None, None)?;
             finish_one_click_compensation(&dir, &mut progress)?;

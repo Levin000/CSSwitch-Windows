@@ -1,3 +1,13 @@
+#[cfg(not(unix))]
+use std::os::windows::fs::OpenOptionsExt as _;
+
+#[cfg(not(unix))]
+use crate::platform::UnixCompatExt;
+#[cfg(not(unix))]
+use crate::platform::OpenOptionsModeExt;
+#[cfg(not(unix))]
+use std::os::windows::fs::OpenOptionsExt as _;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -3507,11 +3517,12 @@ fn parse_sidecar_output(
 
 #[cfg(unix)]
 fn set_nonblocking_stdout(stdout: &std::process::ChildStdout) -> Result<(), String> {
+    #[cfg(unix)]
     use std::os::fd::AsRawFd;
 
     let fd = stdout.as_raw_fd();
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | crate::platform::O_NONBLOCK) } < 0 {
         return Err("无法为 Codex 认证 sidecar 建立有界输出通道。".into());
     }
     Ok(())
@@ -3584,6 +3595,7 @@ fn spawn_codex_auth_sidecar_at(
         .stderr(Stdio::null());
     #[cfg(unix)]
     {
+        #[cfg(unix)]
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
@@ -3643,6 +3655,7 @@ fn spawn_codex_auth_sidecar_at(
 
 fn auth_sidecar_executable_fingerprint(binary: &Path) -> Result<String, String> {
     use std::fs::OpenOptions;
+    #[cfg(unix)]
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
     const MAX_SIDECAR_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
@@ -3651,14 +3664,14 @@ fn auth_sidecar_executable_fingerprint(binary: &Path) -> Result<String, String> 
         .map_err(|_| "Codex 认证 sidecar executable identity 不可读。".to_string())?;
     let mut file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(crate::platform::O_NOFOLLOW | crate::platform::O_CLOEXEC)
         .open(binary)
         .map_err(|_| "Codex 认证 sidecar executable identity 不可读。".to_string())?;
     let opened_before = file
         .metadata()
         .map_err(|_| "Codex 认证 sidecar executable identity 不可读。".to_string())?;
     if !opened_before.file_type().is_file()
-        || opened_before.permissions().mode() & 0o111 == 0
+        || !crate::platform::mode_has_exec(&opened_before)
         || opened_before.len() > MAX_SIDECAR_EXECUTABLE_BYTES
         || opened_before.dev() != named_before.dev()
         || opened_before.ino() != named_before.ino()
@@ -6188,7 +6201,9 @@ mod tests {
     use std::env;
     use std::fs;
     use std::net::TcpListener;
+    #[cfg(unix)]
     use std::os::unix::ffi::OsStrExt;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
     use std::sync::atomic::{AtomicI32, Ordering};
@@ -6220,7 +6235,7 @@ mod tests {
         fn named_script(&self, name: &str, body: &str) -> PathBuf {
             let path = self.0.join(name);
             fs::write(&path, format!("#!/bin/sh\nset -eu\n{body}\n")).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::set_permissions(&path, crate::platform::permissions_from_mode(0o700)).unwrap();
             path
         }
     }
@@ -6863,13 +6878,13 @@ mod tests {
     #[allow(clippy::result_large_err)]
     fn r3_codex_mutation_wait_releases_read_model_and_stale_result_preserves_replacement() {
         let temp = TempDir::new("r3-codex-mutation-owner-cas");
-        fs::set_permissions(&temp.0, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&temp.0, crate::platform::permissions_from_mode(0o700)).unwrap();
         let prior_binary = temp.0.join("prior-science");
         let replacement_binary = temp.0.join("replacement-science");
         fs::write(&prior_binary, b"#!/bin/sh\nexit 0\n").unwrap();
         fs::write(&replacement_binary, b"#!/bin/sh\nexit 0\n# replacement\n").unwrap();
-        fs::set_permissions(&prior_binary, fs::Permissions::from_mode(0o700)).unwrap();
-        fs::set_permissions(&replacement_binary, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&prior_binary, crate::platform::permissions_from_mode(0o700)).unwrap();
+        fs::set_permissions(&replacement_binary, crate::platform::permissions_from_mode(0o700)).unwrap();
         let prior =
             crate::runtime::science::test_runtime_identity(prior_binary.canonicalize().unwrap());
         let replacement = crate::runtime::science::test_runtime_identity(
@@ -6882,7 +6897,7 @@ mod tests {
         ] {
             let config_dir = temp.0.join(format!("config-{case}"));
             fs::create_dir_all(&config_dir).unwrap();
-            fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::set_permissions(&config_dir, crate::platform::permissions_from_mode(0o700)).unwrap();
             config::save_to(
                 &config_dir,
                 &config::Config {
@@ -7012,13 +7027,13 @@ mod tests {
     #[allow(clippy::result_large_err)]
     fn r3_codex_mutation_rejects_preclaim_identity_drift_without_overwriting_replacement() {
         let temp = TempDir::new("r3-codex-mutation-preclaim-cas");
-        fs::set_permissions(&temp.0, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&temp.0, crate::platform::permissions_from_mode(0o700)).unwrap();
         let prior_binary = temp.0.join("prior-science");
         let replacement_binary = temp.0.join("replacement-science");
         fs::write(&prior_binary, b"#!/bin/sh\nexit 0\n").unwrap();
         fs::write(&replacement_binary, b"#!/bin/sh\nexit 0\n# replacement\n").unwrap();
-        fs::set_permissions(&prior_binary, fs::Permissions::from_mode(0o700)).unwrap();
-        fs::set_permissions(&replacement_binary, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&prior_binary, crate::platform::permissions_from_mode(0o700)).unwrap();
+        fs::set_permissions(&replacement_binary, crate::platform::permissions_from_mode(0o700)).unwrap();
         let prior =
             crate::runtime::science::test_runtime_identity(prior_binary.canonicalize().unwrap());
         let replacement = crate::runtime::science::test_runtime_identity(
@@ -7026,7 +7041,7 @@ mod tests {
         );
         let config_dir = temp.0.join("config");
         fs::create_dir_all(&config_dir).unwrap();
-        fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&config_dir, crate::platform::permissions_from_mode(0o700)).unwrap();
         config::save_to(
             &config_dir,
             &config::Config {
@@ -7099,13 +7114,13 @@ mod tests {
     #[allow(clippy::result_large_err)]
     fn downgrade_cleanup_wait_releases_read_model_and_stale_result_preserves_replacement() {
         let temp = TempDir::new("downgrade-stop-owner-cas");
-        fs::set_permissions(&temp.0, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&temp.0, crate::platform::permissions_from_mode(0o700)).unwrap();
         let prior_binary = temp.0.join("prior-science");
         let replacement_binary = temp.0.join("replacement-science");
         fs::write(&prior_binary, b"#!/bin/sh\nexit 0\n").unwrap();
         fs::write(&replacement_binary, b"#!/bin/sh\nexit 0\n# replacement\n").unwrap();
-        fs::set_permissions(&prior_binary, fs::Permissions::from_mode(0o700)).unwrap();
-        fs::set_permissions(&replacement_binary, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&prior_binary, crate::platform::permissions_from_mode(0o700)).unwrap();
+        fs::set_permissions(&replacement_binary, crate::platform::permissions_from_mode(0o700)).unwrap();
         let prior =
             crate::runtime::science::test_runtime_identity(prior_binary.canonicalize().unwrap());
         let replacement = crate::runtime::science::test_runtime_identity(
@@ -7219,7 +7234,7 @@ mod tests {
     #[allow(clippy::result_large_err)]
     fn r3_codex_mutation_gateway_uncertainty_fails_before_config_commit() {
         let temp = TempDir::new("r3-codex-gateway-stop-uncertain");
-        fs::set_permissions(&temp.0, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&temp.0, crate::platform::permissions_from_mode(0o700)).unwrap();
         config::save_to(
             &temp.0,
             &config::Config {
@@ -7720,7 +7735,7 @@ mod tests {
         let started = Instant::now();
         assert!(register_login_process(&supervisor, &reservation.operation_id, process).is_err());
         assert!(started.elapsed() < Duration::from_secs(2));
-        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+        assert_eq!(unsafe { crate::platform::kill(pid as i32, 0) }, -1);
         supervisor.abort_login_start(&reservation.operation_id);
     }
 
@@ -8416,7 +8431,7 @@ mod tests {
     }
 
     fn r0_process_is_running(pid: u32) -> bool {
-        unsafe { libc::kill(pid as i32, 0) == 0 }
+        unsafe { crate::platform::kill(pid as i32, 0) == 0 }
     }
 
     fn p2a_terminate_exact_uncommitted_science(port: u16, pid: u32, process_start: &str) {
@@ -8431,7 +8446,7 @@ mod tests {
             Some(process_start),
             "test cleanup requires the captured process-start identity"
         );
-        assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGTERM) }, 0);
+        assert_eq!(unsafe { crate::platform::kill(pid as i32, libc::SIGTERM) }, 0);
         for _ in 0..100 {
             if crate::runtime::science::test_unique_listener_pid(port) != Some(pid)
                 && crate::runtime::science::test_process_start_identity_for_pid(pid).as_deref()
@@ -8445,7 +8460,7 @@ mod tests {
             && crate::runtime::science::test_process_start_identity_for_pid(pid).as_deref()
                 == Some(process_start)
         {
-            assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGKILL) }, 0);
+            assert_eq!(unsafe { crate::platform::kill(pid as i32, crate::platform::SIGKILL) }, 0);
         }
         for _ in 0..100 {
             if crate::runtime::science::test_unique_listener_pid(port) != Some(pid)
@@ -10692,7 +10707,7 @@ exit 23"#,
         config::save_to(&config_dir, &cfg).unwrap();
         let conflicting_receipt = config_dir.join(config::CONFIG_MUTATION_OPERATION_RECEIPT_FILE);
         fs::write(&conflicting_receipt, b"foreign-receipt").unwrap();
-        fs::set_permissions(&conflicting_receipt, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&conflicting_receipt, crate::platform::permissions_from_mode(0o600)).unwrap();
         let supervisor = Arc::new(CodexAuthSupervisor::default());
         let state = Arc::new(Mutex::new(AppState::default()));
         let lifecycle = crate::lifecycle::Lifecycle::new();
@@ -10777,7 +10792,7 @@ exit 23"#,
         let receipt = config_dir.join(config::CONFIG_MUTATION_OPERATION_RECEIPT_FILE);
         fs::rename(&receipt, config_dir.join("preserved-auth-receipt.json")).unwrap();
         fs::write(&receipt, b"replacement-receipt").unwrap();
-        fs::set_permissions(&receipt, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&receipt, crate::platform::permissions_from_mode(0o600)).unwrap();
 
         complete_login_operation_p2b(
             app.handle().clone(),

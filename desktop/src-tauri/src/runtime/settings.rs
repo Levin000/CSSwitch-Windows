@@ -1,4 +1,15 @@
+#[cfg(not(unix))]
+use std::os::windows::fs::OpenOptionsExt as _;
+
+#[cfg(not(unix))]
+use crate::platform::UnixCompatExt;
+#[cfg(not(unix))]
+use crate::platform::OpenOptionsModeExt;
+#[cfg(not(unix))]
+use std::os::windows::fs::OpenOptionsExt as _;
+
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -64,7 +75,7 @@ fn read_exact_v2_managed_stub(
         Err(_) => return Err("隔离 SSH 配置目录状态无法安全确认".into()),
     };
     // SAFETY: geteuid has no preconditions and does not dereference pointers.
-    let uid = unsafe { libc::geteuid() };
+    let uid = unsafe { crate::platform::geteuid() };
     if dir_metadata.file_type().is_symlink()
         || !dir_metadata.file_type().is_dir()
         || dir_metadata.uid() != uid
@@ -75,7 +86,7 @@ fn read_exact_v2_managed_stub(
     let config = ssh_dir.join("config");
     let mut file = match std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .custom_flags(crate::platform::O_NOFOLLOW | crate::platform::O_NONBLOCK | crate::platform::O_CLOEXEC)
         .open(&config)
     {
         Ok(file) => file,
@@ -205,7 +216,7 @@ impl ManagedSshStubTransaction {
                     file.write_all(&before.bytes)
                         .and_then(|_| file.sync_all())
                         .map_err(|_| "隔离 SSH config 缺失且无法安全恢复")?;
-                    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600))
+                    std::fs::set_permissions(&config, crate::platform::permissions_from_mode(0o600))
                         .map_err(|_| "隔离 SSH config 恢复后无法收紧权限")?;
                     Ok(())
                 }
@@ -312,7 +323,7 @@ pub(crate) fn prevalidate_sandbox_ssh_stub(
         Err(_) => return Err("隔离 SSH config 不是 CSSwitch 管理的安全入口".into()),
     };
     // SAFETY: geteuid has no preconditions and does not dereference pointers.
-    let uid = unsafe { libc::geteuid() };
+    let uid = unsafe { crate::platform::geteuid() };
     if dir_metadata.file_type().is_symlink()
         || !dir_metadata.file_type().is_dir()
         || dir_metadata.uid() != uid
@@ -323,7 +334,7 @@ pub(crate) fn prevalidate_sandbox_ssh_stub(
     let config = ssh_dir.join("config");
     let mut file = match std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .custom_flags(crate::platform::O_NOFOLLOW | crate::platform::O_NONBLOCK | crate::platform::O_CLOEXEC)
         .open(&config)
     {
         Ok(file) => file,
@@ -405,7 +416,7 @@ fn validate_managed_sandbox_ssh_stub_for_config(
     let dir_metadata = std::fs::symlink_metadata(&ssh_dir)
         .map_err(|_| "隔离 SSH 配置目录缺失，拒绝复用运行中的 Science")?;
     // SAFETY: geteuid has no preconditions and does not dereference pointers.
-    let uid = unsafe { libc::geteuid() };
+    let uid = unsafe { crate::platform::geteuid() };
     if !dir_metadata.file_type().is_dir()
         || dir_metadata.file_type().is_symlink()
         || dir_metadata.uid() != uid
@@ -416,7 +427,7 @@ fn validate_managed_sandbox_ssh_stub_for_config(
     let config = ssh_dir.join("config");
     let mut file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .custom_flags(crate::platform::O_NOFOLLOW | crate::platform::O_NONBLOCK | crate::platform::O_CLOEXEC)
         .open(&config)
         .map_err(|_| "隔离 SSH config 缺失或不安全，拒绝复用运行中的 Science")?;
     let metadata = file.metadata().map_err(|_| "无法检查隔离 SSH config")?;
@@ -472,7 +483,7 @@ fn remove_managed_sandbox_ssh_stub_for_config(
         Err(error) => return Err(format!("检查隔离 SSH 配置目录失败：{error}")),
     };
     // SAFETY: geteuid has no preconditions and does not dereference pointers.
-    let uid = unsafe { libc::geteuid() };
+    let uid = unsafe { crate::platform::geteuid() };
     if !dir_metadata.file_type().is_dir() || dir_metadata.uid() != uid {
         return Err("隔离 SSH 配置目录不安全，拒绝撤销授权".into());
     }
@@ -486,7 +497,7 @@ fn remove_managed_sandbox_ssh_stub_for_config(
     }
     let mut file = match std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .custom_flags(crate::platform::O_NOFOLLOW | crate::platform::O_NONBLOCK | crate::platform::O_CLOEXEC)
         .open(&config)
     {
         Ok(file) => file,
@@ -526,7 +537,7 @@ fn remove_managed_sandbox_ssh_stub_for_config(
     }
     let ssh_dir_handle = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(crate::platform::O_DIRECTORY | crate::platform::O_NOFOLLOW | crate::platform::O_CLOEXEC)
         .open(&ssh_dir)
         .map_err(|error| format!("打开隔离 SSH 目录进行同步失败：{error}"))?;
     ssh_dir_handle
@@ -536,7 +547,7 @@ fn remove_managed_sandbox_ssh_stub_for_config(
     if std::fs::remove_dir(&ssh_dir).is_ok() {
         let sandbox_handle = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .custom_flags(crate::platform::O_DIRECTORY | crate::platform::O_NOFOLLOW | crate::platform::O_CLOEXEC)
             .open(sandbox_home)
             .map_err(|error| format!("打开 sandbox HOME 进行同步失败：{error}"))?;
         sandbox_handle
@@ -589,6 +600,7 @@ pub(crate) fn validate_runtime_ports(proxy_port: u16, sandbox_port: u16) -> Resu
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 
     use super::{
@@ -727,7 +739,7 @@ mod tests {
             ),
         )
         .unwrap();
-        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&config, crate::platform::permissions_from_mode(0o600)).unwrap();
         let expected = vec!["alpha".to_string(), "beta".to_string()];
         assert!(validate_managed_sandbox_ssh_stub_for_config(
             &home,
@@ -741,7 +753,7 @@ mod tests {
             &["alpha".to_string()]
         )
         .is_err());
-        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&config, crate::platform::permissions_from_mode(0o644)).unwrap();
         assert!(validate_managed_sandbox_ssh_stub_for_config(
             &home,
             &expected_system_config,
@@ -759,7 +771,7 @@ mod tests {
         ));
         let ssh_dir = home.join(".ssh");
         std::fs::create_dir_all(&ssh_dir).unwrap();
-        std::fs::set_permissions(&ssh_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&ssh_dir, crate::platform::permissions_from_mode(0o700)).unwrap();
         let expected_system_config = home.join("real-home/.ssh/config");
         let config = ssh_dir.join("config");
         std::fs::write(
@@ -770,7 +782,7 @@ mod tests {
             ),
         )
         .unwrap();
-        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&config, crate::platform::permissions_from_mode(0o600)).unwrap();
 
         let transaction = ManagedSshStubTransaction {
             before: ManagedSshStubBefore::Absent,

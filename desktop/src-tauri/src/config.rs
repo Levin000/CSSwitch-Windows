@@ -19,8 +19,11 @@ use std::ffi::CString;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::marker::PhantomData;
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -29,6 +32,7 @@ use crate::model_catalog::{ModelRoute, RoleBindings};
 use crate::provider_contracts::{CredentialSource, ModelPolicy};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
+use crate::platform::CanonicalizeExt;
 
 struct ConfigAccessState {
     downgrade_terminal: bool,
@@ -576,8 +580,8 @@ pub(crate) fn test_arm_pending_manifest_pre_rename_failure(
     AtomicWritePreRenameFailpointGuard,
     std::sync::Arc<std::sync::Mutex<Option<AtomicWritePreRenameObservation>>>,
 )> {
-    let expected = default_dir().canonicalize()?;
-    let actual = directory.canonicalize()?;
+    let expected = default_dir().canonicalize_norm()?;
+    let actual = directory.canonicalize_norm()?;
     if actual != expected {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -2516,7 +2520,9 @@ fn default_dir_from_home(home: &Path) -> PathBuf {
 /// 构建变体固定的配置目录。正式构建为 `$HOME/.csswitch`，Acceptance 为
 /// `$HOME/.csswitch-acceptance`；两者不会因 Finder 使用同一个 HOME 而互相迁移配置。
 pub fn default_dir() -> PathBuf {
+    // Windows 双击启动的进程通常没有 HOME，回退 USERPROFILE；最后才退到 "."。
     let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     default_dir_from_home(&home)
@@ -3480,17 +3486,32 @@ fn ensure_dir(dir: &Path) -> io::Result<()> {
 
 /// 配置文件的所有关键操作都锚定到同一个已打开目录描述符。即使路径名随后被
 /// rename/替换，openat/renameat/linkat 仍只作用于最初审计过的目录。
+/// Windows 降级：无法把目录作为句柄锚定（std 不支持），只保留路径 + lstat
+/// 拒绝符号链接；目录被整目录替换的极端竞态在 Windows 上不设防（注释降级）。
+#[cfg(unix)]
+const FLOCK_SH: i32 = libc::LOCK_SH;
+#[cfg(unix)]
+const FLOCK_EX: i32 = libc::LOCK_EX;
+#[cfg(not(unix))]
+// Windows 降级：无 flock；常量仅作占位参数。
+const FLOCK_SH: i32 = 0;
+#[cfg(not(unix))]
+const FLOCK_EX: i32 = 1;
+
 struct SecureDir {
+    #[cfg(unix)]
     file: fs::File,
     path: PathBuf,
     normalize_file_permissions: bool,
 }
 
 struct ConfigWriterFence {
+    #[cfg(unix)]
     file: fs::File,
 }
 
 struct RuntimeCompensationFence {
+    #[cfg(unix)]
     file: fs::File,
 }
 
@@ -3550,7 +3571,16 @@ pub(crate) struct AuthorityFenceCapability {
 
 impl AuthorityFenceCapability {
     pub(crate) fn fd(&self) -> i32 {
-        self.directory.as_raw_fd()
+        #[cfg(unix)]
+        {
+            self.directory.as_raw_fd()
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows 降级：不存在可继承 fd 的概念；Gateway 侧 Windows 分支
+            // 已不再消费该 env，恒返回 0。
+            0
+        }
     }
 
     pub(crate) fn directory_device(&self) -> u64 {
@@ -3572,6 +3602,7 @@ impl AuthorityFenceCapability {
 
 impl Drop for ConfigWriterFence {
     fn drop(&mut self) {
+        #[cfg(unix)]
         unsafe {
             libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
         }
@@ -3580,6 +3611,7 @@ impl Drop for ConfigWriterFence {
 
 impl Drop for RuntimeCompensationFence {
     fn drop(&mut self) {
+        #[cfg(unix)]
         unsafe {
             libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
         }
@@ -3611,25 +3643,47 @@ impl SecureDir {
         if create {
             ensure_dir(path)?;
         }
-        let mut options = fs::OpenOptions::new();
-        options
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
-        let file = options.open(path)?;
-        if !file.metadata()?.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("配置目录不是目录：{}", path.display()),
-            ));
+        #[cfg(unix)]
+        {
+            let mut options = fs::OpenOptions::new();
+            options
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            let file = options.open(path)?;
+            if !file.metadata()?.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("配置目录不是目录：{}", path.display()),
+                ));
+            }
+            if normalize_permissions {
+                file.set_permissions(fs::Permissions::from_mode(0o700))?;
+            }
+            Ok(Self {
+                file,
+                path: path.to_path_buf(),
+                normalize_file_permissions: normalize_permissions,
+            })
         }
-        if normalize_permissions {
-            file.set_permissions(fs::Permissions::from_mode(0o700))?;
+        #[cfg(not(unix))]
+        {
+            // Windows 降级：目录无法作为 File 打开锚定；仅 lstat 拒绝符号链接
+            // 并按需收紧目录 mode（实际是 no-op，权限由 NTACL 决定）。
+            let metadata = fs::metadata(path)?;
+            if !metadata.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("配置目录不是目录：{}", path.display()),
+                ));
+            }
+            if normalize_permissions {
+                crate::platform::set_path_mode(path, 0o700)?;
+            }
+            Ok(Self {
+                path: path.to_path_buf(),
+                normalize_file_permissions: normalize_permissions,
+            })
         }
-        Ok(Self {
-            file,
-            path: path.to_path_buf(),
-            normalize_file_permissions: normalize_permissions,
-        })
     }
 
     fn name(name: &str) -> io::Result<CString> {
@@ -3644,96 +3698,172 @@ impl SecureDir {
     }
 
     fn read_regular_snapshot(&self, name: &str) -> io::Result<Option<(Vec<u8>, u32)>> {
-        let name = Self::name(name)?;
-        let fd = unsafe {
-            libc::openat(
-                self.file.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::NotFound {
-                return Ok(None);
+        #[cfg(unix)]
+        {
+            let name = Self::name(name)?;
+            let fd = unsafe {
+                libc::openat(
+                    self.file.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::NotFound {
+                    return Ok(None);
+                }
+                if error.raw_os_error() == Some(libc::ELOOP) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "拒绝配置目录内的符号链接",
+                    ));
+                }
+                return Err(error);
             }
-            if error.raw_os_error() == Some(libc::ELOOP) {
+            let file = unsafe { fs::File::from_raw_fd(fd) };
+            let metadata = file.metadata()?;
+            if !metadata.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "拒绝配置目录内的非普通文件",
+                ));
+            }
+            if self.normalize_file_permissions && metadata.nlink() != 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "拒绝配置目录内具有多个 hard link 的文件",
+                ));
+            }
+            if metadata.len() > MAX_CONFIG_FILE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "配置或备份文件过大",
+                ));
+            }
+            let mut mode = metadata.permissions().mode() & 0o777;
+            if self.normalize_file_permissions {
+                file.set_permissions(fs::Permissions::from_mode(0o600))?;
+                mode = 0o600;
+            }
+            let mut bytes = Vec::with_capacity(metadata.len() as usize);
+            file.take(MAX_CONFIG_FILE_BYTES + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > MAX_CONFIG_FILE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "配置或备份文件过大",
+                ));
+            }
+            Ok(Some((bytes, mode)))
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows 降级：无 openat/no-follow，先用 symlink_metadata 拒绝符号
+            // 链接再打开；hard link 检查与 POSIX mode 观测不可用（恒 0o600）。
+            Self::validate_name(name)?;
+            let path = self.path.join(name);
+            let link = match fs::symlink_metadata(&path) {
+                // 与 Unix 分支对齐：目标不存在视为「无内容」而不是错误。
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error),
+                Ok(link) => link,
+            };
+            if link.file_type().is_symlink() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "拒绝配置目录内的符号链接",
                 ));
             }
-            return Err(error);
+            if !link.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "拒绝配置目录内的非普通文件",
+                ));
+            }
+            if link.len() > MAX_CONFIG_FILE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "配置或备份文件过大",
+                ));
+            }
+            let mut file = fs::File::open(&path)?;
+            let mode = 0o600;
+            if self.normalize_file_permissions {
+                crate::platform::set_file_mode(&file, 0o600)?;
+            }
+            let mut bytes = Vec::with_capacity(link.len() as usize);
+            file.take(MAX_CONFIG_FILE_BYTES + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > MAX_CONFIG_FILE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "配置或备份文件过大",
+                ));
+            }
+            Ok(Some((bytes, mode)))
         }
-        let file = unsafe { fs::File::from_raw_fd(fd) };
-        let metadata = file.metadata()?;
-        if !metadata.is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "拒绝配置目录内的非普通文件",
-            ));
-        }
-        if self.normalize_file_permissions && metadata.nlink() != 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "拒绝配置目录内具有多个 hard link 的文件",
-            ));
-        }
-        if metadata.len() > MAX_CONFIG_FILE_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "配置或备份文件过大",
-            ));
-        }
-        let mut mode = metadata.permissions().mode() & 0o777;
-        if self.normalize_file_permissions {
-            file.set_permissions(fs::Permissions::from_mode(0o600))?;
-            mode = 0o600;
-        }
-        let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        file.take(MAX_CONFIG_FILE_BYTES + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > MAX_CONFIG_FILE_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "配置或备份文件过大",
-            ));
-        }
-        Ok(Some((bytes, mode)))
     }
 
     /// 只确认模块自有 pending 名是否为普通文件；不 chmod、不要求单 hard link。
     fn regular_exists_allow_hardlinks(&self, name: &str) -> io::Result<bool> {
-        let name = Self::name(name)?;
-        let fd = unsafe {
-            libc::openat(
-                self.file.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::NotFound {
-                return Ok(false);
+        #[cfg(unix)]
+        {
+            let name = Self::name(name)?;
+            let fd = unsafe {
+                libc::openat(
+                    self.file.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::NotFound {
+                    return Ok(false);
+                }
+                if error.raw_os_error() == Some(libc::ELOOP) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "拒绝版本备份 pending 符号链接",
+                    ));
+                }
+                return Err(error);
             }
-            if error.raw_os_error() == Some(libc::ELOOP) {
+            let file = unsafe { fs::File::from_raw_fd(fd) };
+            let metadata = file.metadata()?;
+            if !metadata.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "拒绝非普通版本备份 pending 文件",
+                ));
+            }
+            Ok(true)
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows 降级：lstat 拒绝符号链接后按存在性判断。
+            Self::validate_name(name)?;
+            let path = self.path.join(name);
+            let link = match fs::symlink_metadata(&path) {
+                Ok(link) => link,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            if link.file_type().is_symlink() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "拒绝版本备份 pending 符号链接",
                 ));
             }
-            return Err(error);
+            if !link.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "拒绝非普通版本备份 pending 文件",
+                ));
+            }
+            Ok(true)
         }
-        let file = unsafe { fs::File::from_raw_fd(fd) };
-        let metadata = file.metadata()?;
-        if !metadata.is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "拒绝非普通版本备份 pending 文件",
-            ));
-        }
-        Ok(true)
     }
 
     fn read_regular(&self, name: &str) -> io::Result<Option<Vec<u8>>> {
@@ -3742,289 +3872,447 @@ impl SecureDir {
     }
 
     fn create_new(&self, name: &str) -> io::Result<fs::File> {
-        let name = Self::name(name)?;
-        let fd = unsafe {
-            libc::openat(
-                self.file.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o600,
-            )
-        };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
+        #[cfg(unix)]
+        {
+            let name = Self::name(name)?;
+            let fd = unsafe {
+                libc::openat(
+                    self.file.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    0o600,
+                )
+            };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(unsafe { fs::File::from_raw_fd(fd) })
         }
-        Ok(unsafe { fs::File::from_raw_fd(fd) })
+        #[cfg(not(unix))]
+        {
+            // Windows 降级：create_new 本身具有 O_EXCL 语义；先 lstat 拒绝同名
+            // 符号链接，mode 收紧交由 NTACL（no-op）。
+            Self::validate_name(name)?;
+            let path = self.path.join(name);
+            if let Ok(link) = fs::symlink_metadata(&path) {
+                if link.file_type().is_symlink() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "拒绝覆盖符号链接",
+                    ));
+                }
+            }
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+        }
     }
 
     fn acquire_config_writer_fence(&self) -> io::Result<ConfigWriterFence> {
-        let name = Self::name(CONFIG_WRITER_LOCK_FILE)?;
-        let fd = unsafe {
-            libc::openat(
-                self.file.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDWR
-                    | libc::O_CREAT
-                    | libc::O_NOFOLLOW
-                    | libc::O_CLOEXEC
-                    | libc::O_NONBLOCK,
-                0o600,
-            )
-        };
-        if fd < 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ELOOP) {
+        #[cfg(unix)]
+        {
+            let name = Self::name(CONFIG_WRITER_LOCK_FILE)?;
+            let fd = unsafe {
+                libc::openat(
+                    self.file.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDWR
+                        | libc::O_CREAT
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC
+                        | libc::O_NONBLOCK,
+                    0o600,
+                )
+            };
+            if fd < 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ELOOP) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "拒绝 config writer lock 符号链接",
+                    ));
+                }
+                return Err(error);
+            }
+            let file = unsafe { fs::File::from_raw_fd(fd) };
+            let metadata = file.metadata()?;
+            if !metadata.is_file() || metadata.nlink() != 1 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "拒绝 config writer lock 符号链接",
+                    "config writer lock 必须是单链接普通文件",
                 ));
             }
-            return Err(error);
-        }
-        let file = unsafe { fs::File::from_raw_fd(fd) };
-        let metadata = file.metadata()?;
-        if !metadata.is_file() || metadata.nlink() != 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "config writer lock 必须是单链接普通文件",
-            ));
-        }
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
 
-        #[cfg(test)]
-        if let Some(marker) = std::env::var_os("CSSWITCH_C1A_EXPECT_LOCK_CONTENTION_MARKER") {
-            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-            if result == 0 {
-                unsafe {
-                    libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+            #[cfg(test)]
+            if let Some(marker) = std::env::var_os("CSSWITCH_C1A_EXPECT_LOCK_CONTENTION_MARKER") {
+                let result =
+                    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                if result == 0 {
+                    unsafe {
+                        libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+                    }
+                    return Err(io::Error::other(
+                        "test-only expected an already-held config writer fence",
+                    ));
                 }
-                return Err(io::Error::other(
-                    "test-only expected an already-held config writer fence",
-                ));
+                let error = io::Error::last_os_error();
+                let raw_error = error.raw_os_error();
+                if raw_error != Some(libc::EWOULDBLOCK) && raw_error != Some(libc::EAGAIN) {
+                    return Err(error);
+                }
+                fs::write(marker, b"contended")?;
             }
-            let error = io::Error::last_os_error();
-            let raw_error = error.raw_os_error();
-            if raw_error != Some(libc::EWOULDBLOCK) && raw_error != Some(libc::EAGAIN) {
-                return Err(error);
-            }
-            fs::write(marker, b"contended")?;
-        }
 
-        loop {
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
-                break;
+            loop {
+                if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                    break;
+                }
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
             }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
-            }
-        }
 
-        // A cooperating writer must keep one stable, persistent lock inode.
-        // Re-open the directory entry after acquisition and reject replacement
-        // instead of letting two writer populations proceed on different inodes.
-        let verify_fd = unsafe {
-            libc::openat(
-                self.file.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
-            )
-        };
-        if verify_fd < 0 {
-            return Err(io::Error::last_os_error());
+            // A cooperating writer must keep one stable, persistent lock inode.
+            // Re-open the directory entry after acquisition and reject replacement
+            // instead of letting two writer populations proceed on different inodes.
+            let verify_fd = unsafe {
+                libc::openat(
+                    self.file.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+                )
+            };
+            if verify_fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let verify = unsafe { fs::File::from_raw_fd(verify_fd) };
+            let verified = verify.metadata()?;
+            if !verified.is_file()
+                || verified.nlink() != 1
+                || verified.dev() != metadata.dev()
+                || verified.ino() != metadata.ino()
+            {
+                return Err(io::Error::other("config writer lock 在获取期间被替换"));
+            }
+            Ok(ConfigWriterFence { file })
         }
-        let verify = unsafe { fs::File::from_raw_fd(verify_fd) };
-        let verified = verify.metadata()?;
-        if !verified.is_file()
-            || verified.nlink() != 1
-            || verified.dev() != metadata.dev()
-            || verified.ino() != metadata.ino()
+        #[cfg(not(unix))]
         {
-            return Err(io::Error::other("config writer lock 在获取期间被替换"));
+            // Windows 降级：无 flock/no-follow。打开（或创建）锁文件并 lstat 拒绝
+            // 符号链接；跨进程互斥退化为「持有一个共享冲突句柄」不可用，单实例
+            // 桌面应用下由 CONFIG_ACCESS 进程内互斥兜底（注释降级）。
+            let _file = self.open_lock_file_degraded(CONFIG_WRITER_LOCK_FILE)?;
+            Ok(ConfigWriterFence {})
         }
-        Ok(ConfigWriterFence { file })
     }
 
-    fn acquire_runtime_compensation_fence(
-        &self,
-        operation: libc::c_int,
-    ) -> io::Result<RuntimeCompensationFence> {
-        let name = Self::name(RUNTIME_COMPENSATION_AUTH_LOCK_FILE)?;
-        let fd = unsafe {
-            libc::openat(
-                self.file.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDWR
-                    | libc::O_CREAT
-                    | libc::O_NOFOLLOW
-                    | libc::O_CLOEXEC
-                    | libc::O_NONBLOCK,
-                0o600,
-            )
-        };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
+    fn acquire_runtime_compensation_fence(&self, operation: i32) -> io::Result<RuntimeCompensationFence> {
+        #[cfg(unix)]
+        {
+            let name = Self::name(RUNTIME_COMPENSATION_AUTH_LOCK_FILE)?;
+            let fd = unsafe {
+                libc::openat(
+                    self.file.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDWR
+                        | libc::O_CREAT
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC
+                        | libc::O_NONBLOCK,
+                    0o600,
+                )
+            };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let file = unsafe { fs::File::from_raw_fd(fd) };
+            let metadata = file.metadata()?;
+            if !metadata.is_file()
+                || metadata.nlink() != 1
+                || metadata.uid() != unsafe { libc::geteuid() }
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "runtime compensation auth fence 必须是当前用户的单链接普通文件",
+                ));
+            }
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            loop {
+                if unsafe { libc::flock(file.as_raw_fd(), operation as libc::c_int) } == 0 {
+                    break;
+                }
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+            let verify_fd = unsafe {
+                libc::openat(
+                    self.file.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+                )
+            };
+            if verify_fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let verified = unsafe { fs::File::from_raw_fd(verify_fd) }.metadata()?;
+            if !verified.is_file()
+                || verified.nlink() != 1
+                || verified.dev() != metadata.dev()
+                || verified.ino() != metadata.ino()
+            {
+                return Err(io::Error::other(
+                    "runtime compensation auth fence 在获取期间被替换",
+                ));
+            }
+            Ok(RuntimeCompensationFence { file })
         }
-        let file = unsafe { fs::File::from_raw_fd(fd) };
-        let metadata = file.metadata()?;
-        if !metadata.is_file()
-            || metadata.nlink() != 1
-            || metadata.uid() != unsafe { libc::geteuid() }
+        #[cfg(not(unix))]
+        {
+            // Windows 降级：无 flock/uid。打开（或创建）锁文件并 lstat 拒绝符号
+            // 链接；跨进程 SH/EX 互斥不可用，注释降级（单实例桌面进程内互斥兜底）。
+            let _ = operation;
+            let _file = self.open_lock_file_degraded(RUNTIME_COMPENSATION_AUTH_LOCK_FILE)?;
+            Ok(RuntimeCompensationFence {})
+        }
+    }
+
+    #[cfg(not(unix))]
+    /// Windows 降级助手：打开（或创建）目录内锁文件；符号链接一律拒绝，
+    /// 保持「绝不跟随链接写」的语义。无 no-follow 原子性，注释降级。
+    fn open_lock_file_degraded(&self, name: &str) -> io::Result<fs::File> {
+        Self::validate_name(name)?;
+        let path = self.path.join(name);
+        if let Ok(link) = fs::symlink_metadata(&path) {
+            if link.file_type().is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("拒绝锁文件符号链接：{name}"),
+                ));
+            }
+        }
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+    }
+
+    #[cfg(not(unix))]
+    /// Windows 降级助手：等价 Unix `Self::name` 的名字校验（CString 版）。
+    fn validate_name(name: &str) -> io::Result<()> {
+        if name.is_empty()
+            || name.as_bytes().contains(&b'/')
+            || name.as_bytes().contains(&b'\\')
+            || name.as_bytes().contains(&0)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "runtime compensation auth fence 必须是当前用户的单链接普通文件",
+                "配置目录内部文件名非法",
             ));
         }
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        loop {
-            if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
-                break;
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
-            }
-        }
-        let verify_fd = unsafe {
-            libc::openat(
-                self.file.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
-            )
-        };
-        if verify_fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let verified = unsafe { fs::File::from_raw_fd(verify_fd) }.metadata()?;
-        if !verified.is_file()
-            || verified.nlink() != 1
-            || verified.dev() != metadata.dev()
-            || verified.ino() != metadata.ino()
-        {
-            return Err(io::Error::other(
-                "runtime compensation auth fence 在获取期间被替换",
-            ));
-        }
-        Ok(RuntimeCompensationFence { file })
+        Ok(())
     }
 
     fn authority_fence_capability(&self) -> io::Result<AuthorityFenceCapability> {
-        let name = Self::name(RUNTIME_COMPENSATION_AUTH_LOCK_FILE)?;
-        let fd = unsafe {
-            libc::openat(
-                self.file.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDWR
-                    | libc::O_CREAT
-                    | libc::O_NOFOLLOW
-                    | libc::O_CLOEXEC
-                    | libc::O_NONBLOCK,
-                0o600,
-            )
-        };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let file = unsafe { fs::File::from_raw_fd(fd) };
-        let metadata = file.metadata()?;
-        if !metadata.is_file()
-            || metadata.nlink() != 1
-            || metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.permissions().mode() & 0o077 != 0
+        #[cfg(unix)]
         {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "runtime compensation auth fence 必须是当前用户的单链接私有普通文件",
-            ));
-        }
-        let inherited_fd = unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_DUPFD, 64) };
-        if inherited_fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let inherited = unsafe { fs::File::from_raw_fd(inherited_fd) };
-        let flags = unsafe { libc::fcntl(inherited.as_raw_fd(), libc::F_GETFD) };
-        if flags < 0
-            || unsafe {
-                libc::fcntl(
-                    inherited.as_raw_fd(),
-                    libc::F_SETFD,
-                    flags & !libc::FD_CLOEXEC,
+            let name = Self::name(RUNTIME_COMPENSATION_AUTH_LOCK_FILE)?;
+            let fd = unsafe {
+                libc::openat(
+                    self.file.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDWR
+                        | libc::O_CREAT
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC
+                        | libc::O_NONBLOCK,
+                    0o600,
                 )
-            } < 0
-        {
-            return Err(io::Error::last_os_error());
+            };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let file = unsafe { fs::File::from_raw_fd(fd) };
+            let metadata = file.metadata()?;
+            if !metadata.is_file()
+                || metadata.nlink() != 1
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.permissions().mode() & 0o077 != 0
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "runtime compensation auth fence 必须是当前用户的单链接私有普通文件",
+                ));
+            }
+            let inherited_fd = unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_DUPFD, 64) };
+            if inherited_fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let inherited = unsafe { fs::File::from_raw_fd(inherited_fd) };
+            let flags = unsafe { libc::fcntl(inherited.as_raw_fd(), libc::F_GETFD) };
+            if flags < 0
+                || unsafe {
+                    libc::fcntl(
+                        inherited.as_raw_fd(),
+                        libc::F_SETFD,
+                        flags & !libc::FD_CLOEXEC,
+                    )
+                } < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            let verified = inherited.metadata()?;
+            let directory = self.file.metadata()?;
+            if !verified.is_dir()
+                || verified.uid() != unsafe { libc::geteuid() }
+                || verified.permissions().mode() & 0o077 != 0
+                || verified.dev() != directory.dev()
+                || verified.ino() != directory.ino()
+            {
+                return Err(io::Error::other(
+                    "runtime compensation auth fence capability identity changed",
+                ));
+            }
+            Ok(AuthorityFenceCapability {
+                directory: inherited,
+                directory_device: directory.dev(),
+                directory_inode: directory.ino(),
+                lock_device: metadata.dev(),
+                lock_inode: metadata.ino(),
+            })
         }
-        let verified = inherited.metadata()?;
-        let directory = self.file.metadata()?;
-        if !verified.is_dir()
-            || verified.uid() != unsafe { libc::geteuid() }
-            || verified.permissions().mode() & 0o077 != 0
-            || verified.dev() != directory.dev()
-            || verified.ino() != directory.ino()
+        #[cfg(not(unix))]
         {
-            return Err(io::Error::other(
-                "runtime compensation auth fence capability identity changed",
-            ));
+            // Windows 降级：无法继承/绑定目录 fd 与 device/inode 身份。Gateway 的
+            // Windows 分支不再消费该 capability（skill bridge 整体禁用），这里仅
+            // 打开锁文件占位并返回全零身份，保持调用方流程可继续。
+            let file = self.open_lock_file_degraded(RUNTIME_COMPENSATION_AUTH_LOCK_FILE)?;
+            Ok(AuthorityFenceCapability {
+                directory: file,
+                directory_device: 0,
+                directory_inode: 0,
+                lock_device: 0,
+                lock_inode: 0,
+            })
         }
-        Ok(AuthorityFenceCapability {
-            directory: inherited,
-            directory_device: directory.dev(),
-            directory_inode: directory.ino(),
-            lock_device: metadata.dev(),
-            lock_inode: metadata.ino(),
-        })
     }
 
     fn rename(&self, from: &str, to: &str) -> io::Result<()> {
-        let from = Self::name(from)?;
-        let to = Self::name(to)?;
-        let result = unsafe {
-            libc::renameat(
-                self.file.as_raw_fd(),
-                from.as_ptr(),
-                self.file.as_raw_fd(),
-                to.as_ptr(),
-            )
-        };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
+        #[cfg(unix)]
+        {
+            let from = Self::name(from)?;
+            let to = Self::name(to)?;
+            let result = unsafe {
+                libc::renameat(
+                    self.file.as_raw_fd(),
+                    from.as_ptr(),
+                    self.file.as_raw_fd(),
+                    to.as_ptr(),
+                )
+            };
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows 降级：路径版 rename（同目录内），等价原子性由 NTFS 提供。
+            Self::validate_name(from)?;
+            Self::validate_name(to)?;
+            fs::rename(self.path.join(from), self.path.join(to))
         }
     }
 
     fn link(&self, from: &str, to: &str) -> io::Result<()> {
-        let from = Self::name(from)?;
-        let to = Self::name(to)?;
-        let result = unsafe {
-            libc::linkat(
-                self.file.as_raw_fd(),
-                from.as_ptr(),
-                self.file.as_raw_fd(),
-                to.as_ptr(),
-                0,
-            )
-        };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
+        #[cfg(unix)]
+        {
+            let from = Self::name(from)?;
+            let to = Self::name(to)?;
+            let result = unsafe {
+                libc::linkat(
+                    self.file.as_raw_fd(),
+                    from.as_ptr(),
+                    self.file.as_raw_fd(),
+                    to.as_ptr(),
+                    0,
+                )
+            };
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows 降级：NTFS 支持硬链接，std::fs::hard_link 具备目标存在即
+            // 失败的 O_EXCL 语义；先 lstat 拒绝符号链接。
+            Self::validate_name(from)?;
+            Self::validate_name(to)?;
+            let from_path = self.path.join(from);
+            if let Ok(link) = fs::symlink_metadata(&from_path) {
+                if link.file_type().is_symlink() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "拒绝为符号链接创建硬链接",
+                    ));
+                }
+            }
+            fs::hard_link(from_path, self.path.join(to))
         }
     }
 
     fn unlink(&self, name: &str) -> io::Result<()> {
-        let name = Self::name(name)?;
-        let result = unsafe { libc::unlinkat(self.file.as_raw_fd(), name.as_ptr(), 0) };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
+        #[cfg(unix)]
+        {
+            let name = Self::name(name)?;
+            let result = unsafe { libc::unlinkat(self.file.as_raw_fd(), name.as_ptr(), 0) };
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows 降级：先 lstat 拒绝符号链接，再按普通文件删除。
+            Self::validate_name(name)?;
+            let path = self.path.join(name);
+            if let Ok(link) = fs::symlink_metadata(&path) {
+                if link.file_type().is_symlink() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "拒绝删除符号链接",
+                    ));
+                }
+            }
+            fs::remove_file(&path)
         }
     }
 
     fn sync(&self) -> io::Result<()> {
-        self.file.sync_all()
+        #[cfg(unix)]
+        {
+            self.file.sync_all()
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows 降级：无法以句柄形式 fsync 目录；跳过目录级持久化，
+            // 文件级 sync_all 仍由各写入点自行执行（注释降级）。
+            Ok(())
+        }
     }
 
     fn display_path(&self, name: &str) -> PathBuf {
@@ -4032,9 +4320,19 @@ impl SecureDir {
     }
 
     fn same_directory(&self, other: &Self) -> io::Result<bool> {
-        let left = self.file.metadata()?;
-        let right = other.file.metadata()?;
-        Ok(left.dev() == right.dev() && left.ino() == right.ino())
+        #[cfg(unix)]
+        {
+            let left = self.file.metadata()?;
+            let right = other.file.metadata()?;
+            Ok(left.dev() == right.dev() && left.ino() == right.ino())
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows 降级：无 device/inode，等价近似为 canonical 路径相等。
+            let left = self.path.canonicalize_norm()?;
+            let right = other.path.canonicalize_norm()?;
+            Ok(left == right)
+        }
     }
 }
 
@@ -4048,7 +4346,7 @@ pub(crate) fn acquire_runtime_compensation_auth_lease(
     dir: &Path,
 ) -> io::Result<RuntimeCompensationAuthLease> {
     let secure = SecureDir::open(dir, false)?;
-    let fence = secure.acquire_runtime_compensation_fence(libc::LOCK_SH)?;
+    let fence = secure.acquire_runtime_compensation_fence(FLOCK_SH)?;
     Ok(RuntimeCompensationAuthLease {
         _secure: secure,
         _fence: fence,
@@ -4064,12 +4362,12 @@ pub(crate) fn acquire_authority_writer_guard() -> io::Result<AuthorityWriterGuar
 
 fn acquire_authority_writer_guard_at(dir: &Path) -> io::Result<AuthorityWriterGuard<'static>> {
     let secure = SecureDir::open(dir, true)?;
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     if let Some(marker) = std::env::var_os("CSSWITCH_TEST_AUTHORITY_WRITER_SH_PROBE_MARKER") {
         // A test-only nonblocking probe records that this precise normal
         // writer reached the SH flock and observed an EX owner. The real
         // blocking acquisition immediately below remains the production path.
-        let probe = secure.acquire_runtime_compensation_fence(libc::LOCK_SH | libc::LOCK_NB);
+        let probe = secure.acquire_runtime_compensation_fence(FLOCK_SH | libc::LOCK_NB);
         match probe {
             Ok(fence) => {
                 drop(fence);
@@ -4084,7 +4382,7 @@ fn acquire_authority_writer_guard_at(dir: &Path) -> io::Result<AuthorityWriterGu
             Err(error) => return Err(error),
         }
     }
-    let fence = secure.acquire_runtime_compensation_fence(libc::LOCK_SH)?;
+    let fence = secure.acquire_runtime_compensation_fence(FLOCK_SH)?;
     Ok(AuthorityWriterGuard {
         _kind: AuthorityWriterGuardKind::Shared {
             _secure: secure,
@@ -4133,7 +4431,7 @@ pub(crate) fn acquire_runtime_compensation_publication_lease(
     dir: &Path,
 ) -> io::Result<RuntimeCompensationPublicationLease> {
     let secure = SecureDir::open(dir, false)?;
-    let fence = secure.acquire_runtime_compensation_fence(libc::LOCK_EX)?;
+    let fence = secure.acquire_runtime_compensation_fence(FLOCK_EX)?;
     Ok(RuntimeCompensationPublicationLease {
         _secure: secure,
         _fence: fence,
@@ -4144,7 +4442,7 @@ pub(crate) fn acquire_runtime_compensation_replay_lease(
     dir: &Path,
 ) -> io::Result<RuntimeCompensationReplayLease> {
     let secure = SecureDir::open(dir, false)?;
-    let fence = secure.acquire_runtime_compensation_fence(libc::LOCK_EX)?;
+    let fence = secure.acquire_runtime_compensation_fence(FLOCK_EX)?;
     Ok(RuntimeCompensationReplayLease {
         _secure: secure,
         _fence: fence,
@@ -4155,7 +4453,7 @@ pub(crate) fn acquire_runtime_history_effect_lease(
     dir: &Path,
 ) -> io::Result<RuntimeHistoryEffectLease> {
     let secure = SecureDir::open(dir, false)?;
-    let fence = secure.acquire_runtime_compensation_fence(libc::LOCK_EX)?;
+    let fence = secure.acquire_runtime_compensation_fence(FLOCK_EX)?;
     Ok(RuntimeHistoryEffectLease {
         _secure: secure,
         _fence: fence,
@@ -5065,7 +5363,7 @@ where
             let restore_result = (|| -> io::Result<()> {
                 let mut restore_file = secure.create_new(&restore_tmp)?;
                 restore_file.write_all(&old_bytes)?;
-                restore_file.set_permissions(fs::Permissions::from_mode(old_mode))?;
+                crate::platform::set_file_mode(&restore_file, old_mode)?;
                 restore_file.sync_all()?;
                 drop(restore_file);
                 secure.rename(&restore_tmp, target)?;

@@ -1,6 +1,37 @@
 use super::*;
 
 pub(super) fn open_official_inner() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        // Windows 移植：官方模式打开本机安装的 Claude Science。
+        use crate::platform::CreationFlagsExt;
+        let candidates = [
+            std::env::var_os("CSSWITCH_SCIENCE_APP_BIN").map(std::path::PathBuf::from),
+            std::env::var_os("LOCALAPPDATA").map(|value| {
+                std::path::PathBuf::from(value).join(r"Programs\ClaudeScience\claude-science.exe")
+            }),
+        ];
+        let app = candidates
+            .into_iter()
+            .flatten()
+            .find(|path| path.is_file())
+            .ok_or("未找到官方 Claude Science（可用 CSSWITCH_SCIENCE_APP_BIN 指定路径）。")?;
+        let status = Command::new("cmd")
+            .args(["/C", "start", "", &app.to_string_lossy()])
+            .env_remove("ANTHROPIC_BASE_URL")
+            .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("ANTHROPIC_AUTH_TOKEN")
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .status()
+            .map_err(|e| format!("打开官方 Claude Science 失败：{e}"))?;
+        return if status.success() {
+            Ok(())
+        } else {
+            Err("未能打开 Claude Science。请确认已安装官方 Claude Science。".into())
+        };
+    }
+    #[cfg(unix)]
+    {
     let app_path = "/Applications/Claude Science.app";
     let mut cmd = Command::new("open");
     if Path::new(app_path).is_dir() {
@@ -15,6 +46,7 @@ pub(super) fn open_official_inner() -> Result<(), String> {
         Ok(s) if s.success() => Ok(()),
         Ok(_) => Err("未能打开 Claude Science。请确认已安装官方 Claude Science。".into()),
         Err(e) => Err(format!("打开官方 Claude Science 失败：{e}")),
+    }
     }
 }
 

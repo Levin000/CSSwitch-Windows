@@ -92,7 +92,7 @@ fn valid_science_runtime_selection(selection: &ScienceRuntimeSelection) -> bool 
 
 fn private_science_runtime_selection_file(metadata: &fs::Metadata) -> bool {
     metadata.file_type().is_file()
-        && metadata.uid() == unsafe { libc::geteuid() }
+        && metadata.uid() == unsafe { crate::platform::geteuid() }
         && metadata.permissions().mode() & 0o077 == 0
         && metadata.nlink() == 1
         && metadata.len() > 0
@@ -122,7 +122,7 @@ fn read_science_runtime_selection_snapshot(
     }
     let mut file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(crate::platform::O_NOFOLLOW | crate::platform::O_CLOEXEC)
         .open(&path)
         .map_err(|error| format!("打开 Science runtime selection 失败：{error}"))?;
     let opened = file
@@ -188,7 +188,7 @@ fn write_science_runtime_selection_cas(
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .custom_flags(crate::platform::O_NOFOLLOW | crate::platform::O_CLOEXEC)
             .open(&temp)
             .map_err(|error| format!("创建 Science runtime selection 临时文件失败：{error}"))?;
         file.write_all(&bytes)
@@ -205,8 +205,7 @@ fn write_science_runtime_selection_cas(
         if SCIENCE_SELECTION_FAIL_NEXT_DIRECTORY_SYNC.swap(false, Ordering::SeqCst) {
             return Err("测试注入：Science runtime selection rename 后目录持久化失败".into());
         }
-        File::open(root)
-            .and_then(|directory| directory.sync_all())
+        crate::platform::sync_directory(root)
             .map_err(|error| format!("持久化 Science runtime selection 目录失败：{error}"))?;
         Ok(())
     })();
@@ -257,8 +256,7 @@ fn remove_science_runtime_selection_cas(
     }
     fs::remove_file(root.join(SCIENCE_RUNTIME_SELECTION_FILE))
         .map_err(|error| format!("回滚 Science runtime selection 失败：{error}"))?;
-    File::open(root)
-        .and_then(|directory| directory.sync_all())
+    crate::platform::sync_directory(root)
         .map_err(|error| format!("持久化 Science runtime selection 回滚失败：{error}"))
 }
 
@@ -405,16 +403,16 @@ fn runtime_from_pinned_selection(
     let root_metadata = root
         .symlink_metadata()
         .map_err(|_| "Science active runtime snapshot 目录不可用")?;
-    if root.canonicalize().ok().as_deref() != Some(root.as_path())
+    if root.canonicalize_norm().ok().as_deref() != Some(root.as_path())
         || !root_metadata.file_type().is_dir()
-        || root_metadata.uid() != unsafe { libc::geteuid() }
-        || root_metadata.permissions().mode() & 0o777 != 0o700
+        || root_metadata.uid() != unsafe { crate::platform::geteuid() }
+        || !crate::platform::dir_mode_is_0700(&root_metadata)
     {
         return Err("Science active runtime snapshot 目录身份或权限不安全".into());
     }
     let path = root.join(format!("claude-science-{}", pinned.sha256));
     let canonical = path
-        .canonicalize()
+        .canonicalize_norm()
         .map_err(|_| "Science active runtime snapshot 不可用")?;
     if canonical != path {
         return Err("Science active runtime snapshot 不是 canonical path".into());
@@ -423,7 +421,7 @@ fn runtime_from_pinned_selection(
         .symlink_metadata()
         .map_err(|_| "Science active runtime snapshot 身份不可用")?;
     if !metadata.file_type().is_file()
-        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.uid() != unsafe { crate::platform::geteuid() }
         || metadata.permissions().mode() & 0o777 != 0o500
         || metadata.nlink() != 1
         || metadata.len() != pinned.size
